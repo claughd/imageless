@@ -1,0 +1,17 @@
+[package]
+name = "imageless-vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Run an imageless release or flake as a Firecracker microVM (prototype)"
+publish = false
+
+[[bin]]
+name = "imageless-vm"
+path = "src/main.rs"
+
+[dependencies]
+# A node-side component like the resolver: it builds requests itself.
+imageless = { path = "../imageless", features = ["daemon"] }
+serde_json = { workspace = true }

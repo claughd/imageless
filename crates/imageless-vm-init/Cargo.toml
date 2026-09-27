@@ -1,0 +1,17 @@
+[package]
+name = "imageless-vm-init"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PID 1 of an imageless microVM: assemble the release root and run its process"
+publish = false
+
+[[bin]]
+name = "imageless-vm-init"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }

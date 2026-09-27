@@ -348,6 +348,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "imageless-vm"
+version = "0.1.0"
+dependencies = [
+ "imageless",
+ "serde_json",
+]
+
+[[package]]
+name = "imageless-vm-init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -673,7 +673,16 @@
           inherit cri-embedded-seed cri-embedded-image;
           inherit stock-oci-smoke;
           default = imageless-runc;
-        });
+        } // lib.optionalAttrs (system == "x86_64-linux") (
+          # microVMs (prototype, crates/imageless-vm): the guest kernel is an
+          # x86_64 build for now.
+          let vm = import ./nix/vm { inherit lib pkgs imageless; }; in {
+            imageless-vm = vm.tool;
+            imageless-vm-kernel = vm.kernel;
+            imageless-vm-init = vm.init;
+            imageless-vm-boot-smoke = vm.bootSmoke;
+          }
+        ));
 
       # `nix flake check` evaluates every derivation under `packages` and
       # `checks`. A NixOS VM test's qemu closure reads the .drv it seeds via
