@@ -333,12 +333,31 @@
             # must already exist in the materialized root.
             touch $out/etc/hostname $out/etc/hosts $out/etc/resolv.conf
           '';
-          smoke-release = pkgs.callPackage ./nix/release-catalog.nix {
+          smoke-release-unsigned = pkgs.callPackage ./nix/release-catalog.nix {
             rootfsTargets.${system} = smoke-rootfs;
             issuer = "imageless-smoke";
             releaseName = "cri";
             cache = "local";
           };
+          # Signed the way a publisher signs (SPEC.md §6.1): `minisign -S`
+          # beside the manifest. The key is a test key committed to this
+          # repository, which is only acceptable because nothing but this
+          # smoke trusts it; a real signing key never enters the Nix store.
+          smoke-release-public-key = builtins.elemAt
+            (lib.splitString "\n" (builtins.readFile ./nix/test-keys/release-smoke.pub)) 1;
+          smoke-release = pkgs.runCommand "imageless-release-imageless-smoke-signed"
+            {
+              nativeBuildInputs = [ pkgs.minisign ];
+              inherit (smoke-release-unsigned) passthru;
+            }
+            ''
+              cp -r ${smoke-release-unsigned} $out
+              chmod -R u+w $out
+              manifest=$out/sha256/${smoke-release-unsigned.digest}.json
+              minisign -S -s ${./nix/test-keys/release-smoke.key} -m "$manifest" \
+                -t "imageless-smoke/cri"
+              minisign -V -p ${./nix/test-keys/release-smoke.pub} -m "$manifest"
+            '';
           # Parameterized over containerd so the in-guest ctr client always
           # matches the node's daemon generation (a 2.x ctr against a 1.x
           # daemon would test client skew, not the runtime contract).
@@ -427,6 +446,7 @@
                         directory = smoke-release;
                       };
                       allowedReleases = [ "cri" ];
+                      signingKeys = [ smoke-release-public-key ];
                       caches.local = {
                         substituter = "file:///nix/store";
                         publicKeys = [ ];
@@ -779,6 +799,24 @@
                   policy.evalAllowedUriPrefixes = [ "path:" ];
                 };
               };
+              signingKey = "RWTZNBpKhXyctgMFuCJ6TzgLNLn0gAYuT1WOOc69Cc72tFLXKOvGtju0";
+              revoked = lib.strings.replicate 64 "a";
+              signed = evalNode {
+                services.imageless = {
+                  enable = true;
+                  policy.issuers.acme = {
+                    source = { kind = "https"; baseUrl = "https://releases.example"; };
+                    allowedReleases = [ "api" ];
+                    caches.main.substituter = "https://cache.example";
+                    signingKeys = [ signingKey ];
+                    revokedManifests = [ revoked ];
+                  };
+                };
+              };
+              signedPolicy = builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile
+                (lib.removePrefix "C+ /etc/imageless/policy.json - - - - "
+                  (lib.findFirst (lib.hasPrefix "C+ /etc/imageless/policy.json") null
+                    signed.systemd.tmpfiles.rules))));
               k3s = evalNode {
                 services.k3s.enable = true;
                 services.imageless = {
@@ -813,6 +851,11 @@
             assert lib.hasInfix "--development-worker"
               daemon.systemd.services.imageless-resolver.serviceConfig.ExecStart;
             assert daemon.users.users ? imageless-dev;
+            # Issuer signing policy reaches the node file under the names the
+            # resolver reads (SPEC.md §6.1).
+            assert signedPolicy.issuers.acme.signing_keys == [ signingKey ];
+            assert signedPolicy.issuers.acme.allow_unsigned == false;
+            assert signedPolicy.issuers.acme.revoked_manifests == [ revoked ];
             # k3s mode: the handler lives in a drop-in k3s's containerd
             # imports, the NixOS containerd stays off, and k3s (whose
             # containerd execs the shim) carries the shim's environment.

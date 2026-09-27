@@ -226,6 +226,37 @@ annotation families mutually exclusive) or with `--output` (a release manifest
 names its own rootfs, so the node never reads an output annotation and a pod
 claiming one would be quietly wrong).
 
+Nodes also require every release to be **signed** by a key their policy trusts
+for its issuer (SPEC §6.1). The digest only proves the manifest is the one the
+pod named; the signature proves the issuer published it. Publish a
+[minisign](https://jedisct1.github.io/minisign/) signature beside each
+manifest:
+
+```bash
+minisign -G -p issuer.pub -s issuer.key              # once; keep issuer.key off nodes
+minisign -S -s issuer.key -m catalog/sha256/<digest>.json   # writes <digest>.json.minisig
+```
+
+and put the second line of `issuer.pub` in the issuer's node policy:
+
+```json
+"issuers": {
+  "example": {
+    "source": { "kind": "https", "base_url": "https://releases.example.com" },
+    "allowed_releases": ["agent"],
+    "caches": { "main": { "substituter": "https://cache.example.com", "public_keys": ["cache.example.com-1:…"] } },
+    "signing_keys": ["RWTZNBpKhXyctgMFuCJ6TzgLNLn0gAYuT1WOOc69Cc72tFLXKOvGtju0"],
+    "revoked_manifests": []
+  }
+}
+```
+
+An issuer without keys must say `"allow_unsigned": true`, which lets anyone
+who can write its catalog choose what runs. List two keys while rotating, and
+add a digest to `revoked_manifests` to withdraw a release that was validly
+signed. SPEC §6.1 covers rotation and compromise recovery. With the NixOS
+module these are `signingKeys`, `allowUnsigned`, and `revokedManifests`.
+
 `doctor` reports whether a cluster is prepared at all:
 
 ```bash
@@ -256,7 +287,7 @@ imageless exists because we need a different set of guarantees:
 |---|---|---|
 | **Where the flake lives** | A flake *reference* in pod metadata; the node fetches and builds whatever the annotation points at. | **In the image layers.** The deployable artifact is self-contained and content-addressed; registries, digest pinning, admission policy, and air-gapped nodes work unchanged. Pointing at an external flake ref is *also* supported — but as a mode the node's policy must explicitly enable, not the default trust model. |
 | **Interception seam** | A containerd TTRPC shim wrapping `Task.Create` — coupled to containerd's shim interfaces and version, Kubernetes-only. | The `runc create` CLI seam (or direct library linkage in your runtime) — works for raw Docker, containerd 1.x and 2.x, and any CRI, with no TTRPC surface to track. |
-| **Trust and policy** | The node builds what workloads name; isolation/allowlisting is future work. | Node-owned policy: evaluation is **off by default** (`cache_only`), an enabled node still evaluates only URI prefixes its policy allow-lists, staged sources are size/entry-bounded and symlink-free, and production nodes resolve only digest-addressed releases from allow-listed issuers and caches. Privilege separation is opt-in: see below. |
+| **Trust and policy** | The node builds what workloads name; isolation/allowlisting is future work. | Node-owned policy: evaluation is **off by default** (`cache_only`), an enabled node still evaluates only URI prefixes its policy allow-lists, staged sources are size/entry-bounded and symlink-free, and production nodes resolve only digest-addressed, issuer-signed releases from allow-listed issuers and caches. Privilege separation is opt-in: see below. |
 | **Lifecycle correctness** | Store GC is delegated to the operator. | GC roots are tied to the container: registered at create, released on failure or delete; a live container survives `nix-collect-garbage`. Atomic spec rewrite, bounded materialization with process-tree kill, fail-closed validation. |
 | **Scope** | An experimental tool. | A spec with a reference shim, acceptance gates (Docker embedded-layer proof + CRI lifecycle VM test), and a library for embedding into other OCI runtimes. |
 
@@ -400,7 +431,7 @@ than adding to them:
 
 | Stage | Carved out of | Meaning |
 |---|---|---|
-| `manifest_fetch` | `policy_verification` | Fetching the release manifest: a network round trip on an HTTPS issuer. A slow catalog used to be indistinguishable from a slow policy check. |
+| `manifest_fetch` | `policy_verification` | Fetching the release manifest and its signature, and verifying the signature: network round trips on an HTTPS issuer. A slow catalog used to be indistinguishable from a slow policy check. |
 | `staging` | `substitution` | Copying an embedded development source out of the image. Zero for a release, and for an external reference evaluated where it stands. |
 | `evaluation` | `substitution` | The Nix process itself. The field most likely to explain a create that spent minutes. |
 | `root_registration` | `substitution` | Registering the GC root. For a create that joined another's in-flight materialization, this is the whole of its own Nix cost, and the gap to `substitution` is what it spent waiting. |

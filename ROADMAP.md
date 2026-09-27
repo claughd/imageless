@@ -125,9 +125,15 @@ nodes), so its hardening is committed work, paced by that deployment:
 - [ ] Threat-model document: compromised workloads, malicious caches, staging
       abuse, reboot cleanup; move the development evaluator into a dedicated
       service cgroup rather than UID-wide rlimits.
-- [ ] Detached signatures over canonical manifest bytes (minisign-style), with
-      node-owned issuer keys, rotation, revocation, and compromised-catalog
-      recovery. Digest integrity exists today; authenticity does not.
+- [x] Detached signatures over canonical manifest bytes (SPEC §6.1): stock
+      minisign sidecars (`sha256/<digest>.json.minisig`), node-owned keys per
+      issuer, signatures required unless an issuer is explicitly
+      `allow_unsigned`, several keys at once for rotation, and
+      `revoked_manifests` for signed releases a node must still refuse.
+      Verified against minisign 0.12's own output and through the resolver
+      daemon's refusal paths. The CRI VM gate now signs its catalog, but it
+      has not been booted since, because the environment that wrote this
+      had no KVM.
 - [ ] Private/authorized cache access without distributing cache credentials to
       workloads.
 - [ ] Enough recorded evaluation/build input to reproduce a release after cache

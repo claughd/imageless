@@ -52,6 +52,30 @@ let
         default = { };
         description = "Cache identities this issuer's release targets may select.";
       };
+      signingKeys = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3" ];
+        description = ''
+          Minisign public keys (the base64 line of a `.pub` file) whose
+          signatures the node accepts on this issuer's manifests (SPEC.md
+          §6.1). List the old and new key together while rotating.
+        '';
+      };
+      allowUnsigned = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Accept this issuer's manifests without a signature, so that anyone
+          who can write the catalog chooses what runs. Exclusive with
+          signingKeys.
+        '';
+      };
+      revokedManifests = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Manifest digests (64 lowercase hex digits) refused even when validly signed.";
+      };
     };
   };
   policy = {
@@ -69,6 +93,9 @@ let
             base_url = issuer.source.baseUrl;
           };
         allowed_releases = issuer.allowedReleases;
+        signing_keys = issuer.signingKeys;
+        allow_unsigned = issuer.allowUnsigned;
+        revoked_manifests = issuer.revokedManifests;
         caches = lib.mapAttrs
           (_: cache: {
             substituter = cache.substituter;
@@ -275,6 +302,10 @@ in
         {
           assertion = issuer.caches != { };
           message = "services.imageless.policy.issuers.${name}.caches must be non-empty";
+        }
+        {
+          assertion = (issuer.signingKeys != [ ]) != issuer.allowUnsigned;
+          message = "services.imageless.policy.issuers.${name} must set exactly one of signingKeys and allowUnsigned";
         }
       ])
       cfg.policy.issuers);

@@ -887,6 +887,7 @@ impl Resolver {
                 false,
             ));
         }
+        release::refuse_revoked(issuer, reference)?;
         // A network round trip on an HTTPS issuer, and the reason
         // `policy_verification_us` used to grow with catalog latency: it spans
         // this call, so a slow catalog was indistinguishable from a slow policy
@@ -896,6 +897,14 @@ impl Resolver {
                 &issuer.source,
                 &reference.sha256,
                 remaining(deadline, "while fetching the release manifest")?,
+            )
+        })?;
+        StageClock::time(&clock.manifest_fetch_us, || {
+            release::authenticate_manifest(
+                issuer,
+                reference,
+                &bytes,
+                remaining(deadline, "while fetching the release manifest signature")?,
             )
         })?;
         let manifest = release::parse_full_manifest(&bytes, reference)?;

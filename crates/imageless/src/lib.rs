@@ -14,6 +14,7 @@ mod client;
 mod confine;
 mod gc;
 mod materialize;
+mod minisign;
 mod mounts;
 mod nix;
 mod release;

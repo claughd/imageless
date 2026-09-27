@@ -6,6 +6,7 @@
 //! a Nix closure to a cache and emit canonical manifest JSON conforms.
 
 use crate::materialize::{ErrorCategory, ResolutionError};
+use crate::minisign;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -514,6 +515,21 @@ pub struct IssuerPolicy {
     pub allowed_releases: Vec<String>,
     #[serde(default)]
     pub caches: HashMap<String, CachePolicy>,
+    // Minisign public keys (the base64 line `minisign -P` takes) whose
+    // signatures this node accepts on the issuer's manifests (SPEC §6.1).
+    // Listing several is how a key is rotated.
+    #[serde(default)]
+    pub signing_keys: Vec<String>,
+    // Accept this issuer's manifests without a signature: anyone who can
+    // write the catalog then chooses what runs. Exclusive with signing_keys,
+    // and never the default.
+    #[serde(default)]
+    pub allow_unsigned: bool,
+    // Manifest digests this node refuses even when validly signed: a release
+    // withdrawn after it was published, which a compromised catalog could
+    // otherwise re-point a channel at.
+    #[serde(default)]
+    pub revoked_manifests: Vec<String>,
 }
 
 impl IssuerPolicy {
@@ -613,6 +629,38 @@ pub(crate) fn validate_policy(
         if issuer.caches.is_empty() {
             return Err(invalid_policy("issuer has no authorized caches"));
         }
+        match (issuer.signing_keys.is_empty(), issuer.allow_unsigned) {
+            (true, false) => {
+                return Err(invalid_policy(
+                    "issuer has no manifest signing keys; list signing_keys, or set allow_unsigned to accept unsigned manifests",
+                ))
+            }
+            (false, true) => {
+                return Err(invalid_policy(
+                    "issuer sets both signing_keys and allow_unsigned",
+                ))
+            }
+            _ => {}
+        }
+        let mut key_ids = HashSet::new();
+        for key in &issuer.signing_keys {
+            let key = minisign::PublicKey::parse(key)
+                .ok_or_else(|| invalid_policy("issuer signing key is not a minisign public key"))?;
+            if !key_ids.insert(key.key_id()) {
+                return Err(invalid_policy(
+                    "issuer lists two signing keys with one key id",
+                ));
+            }
+        }
+        if !issuer
+            .revoked_manifests
+            .iter()
+            .all(|digest| valid_digest(digest))
+        {
+            return Err(invalid_policy(
+                "revoked manifest is not a 64-digit lowercase hex digest",
+            ));
+        }
         for (identity, cache) in &issuer.caches {
             if !valid_identifier(identity)
                 || !(cache.substituter.starts_with("https://")
@@ -630,6 +678,13 @@ pub(crate) fn validate_policy(
     Ok(())
 }
 
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn valid_release_prefix(value: &str) -> bool {
     value.trim_end_matches('/').split('/').all(valid_identifier)
 }
@@ -643,9 +698,93 @@ pub(crate) fn fetch_manifest(
     digest: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, ResolutionError> {
+    fetch_catalog_file(
+        source,
+        &format!("{digest}.json"),
+        MAX_MANIFEST_BYTES,
+        timeout,
+        fetch_error,
+        fetch_too_large,
+    )
+}
+
+/// Refuses a digest node policy revoked for its issuer, before anything is
+/// fetched: a revoked release fails the same way whether or not its catalog
+/// is reachable.
+pub(crate) fn refuse_revoked(
+    issuer: &IssuerPolicy,
+    reference: &ReleaseReference,
+) -> Result<(), ResolutionError> {
+    if issuer.revoked_manifests.contains(&reference.sha256) {
+        return Err(ResolutionError::new(
+            ErrorCategory::PolicyDenied,
+            "release manifest is revoked by node policy",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a manifest the issuer's node policy does not authenticate: unless
+/// the issuer is `allow_unsigned`, one without a sidecar signature by one of
+/// the issuer's keys (SPEC §6.1). The digest is checked first, so a catalog
+/// serving the wrong bytes is reported as that rather than as a bad
+/// signature.
+pub(crate) fn authenticate_manifest(
+    issuer: &IssuerPolicy,
+    reference: &ReleaseReference,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), ResolutionError> {
+    if digest(bytes) != reference.sha256 {
+        return Err(ResolutionError::new(
+            ErrorCategory::DigestMismatch,
+            "release manifest digest does not match the requested release",
+            false,
+        ));
+    }
+    if issuer.allow_unsigned {
+        return Ok(());
+    }
+    let sidecar = fetch_catalog_file(
+        &issuer.source,
+        &format!("{}.json.minisig", reference.sha256),
+        minisign::MAX_SIGNATURE_BYTES,
+        timeout,
+        signature_fetch_error,
+        signature_too_large,
+    )?;
+    let keys: Vec<minisign::PublicKey> = issuer
+        .signing_keys
+        .iter()
+        .filter_map(|key| minisign::PublicKey::parse(key))
+        .collect();
+    minisign::verify(&sidecar, bytes, &keys).map_err(|error| {
+        let diagnostic = match error {
+            minisign::SignatureError::Malformed => {
+                "release manifest signature is not a minisign signature"
+            }
+            minisign::SignatureError::UnknownKey => {
+                "release manifest is not signed by a key this node trusts for its issuer"
+            }
+            minisign::SignatureError::Invalid => "release manifest signature does not verify",
+        };
+        ResolutionError::new(ErrorCategory::PolicyDenied, diagnostic, false)
+    })
+}
+
+/// Reads `sha256/<name>` from an issuer catalog, at most `limit` bytes.
+fn fetch_catalog_file(
+    source: &ManifestSource,
+    name: &str,
+    limit: usize,
+    timeout: Duration,
+    fetch_error: fn() -> ResolutionError,
+    too_large: fn() -> ResolutionError,
+) -> Result<Vec<u8>, ResolutionError> {
     match source {
         ManifestSource::Local { directory } => {
-            let path = directory.join("sha256").join(format!("{digest}.json"));
+            let path = directory.join("sha256").join(name);
             let canonical_directory =
                 std::fs::canonicalize(directory).map_err(|_| fetch_error())?;
             let canonical_path = std::fs::canonicalize(&path).map_err(|_| fetch_error())?;
@@ -657,8 +796,8 @@ pub(crate) fn fetch_manifest(
                 ));
             }
             let bytes = std::fs::read(canonical_path).map_err(|_| fetch_error())?;
-            if bytes.len() > MAX_MANIFEST_BYTES {
-                return Err(fetch_too_large());
+            if bytes.len() > limit {
+                return Err(too_large());
             }
             Ok(bytes)
         }
@@ -670,7 +809,7 @@ pub(crate) fn fetch_manifest(
                     false,
                 ));
             }
-            let url = format!("{}/sha256/{digest}.json", base_url.trim_end_matches('/'));
+            let url = format!("{}/sha256/{name}", base_url.trim_end_matches('/'));
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_global(Some(timeout))
                 .max_redirects(0)
@@ -680,11 +819,11 @@ pub(crate) fn fetch_manifest(
             let bytes = response
                 .body_mut()
                 .with_config()
-                .limit((MAX_MANIFEST_BYTES + 1) as u64)
+                .limit((limit + 1) as u64)
                 .read_to_vec()
                 .map_err(|_| fetch_error())?;
-            if bytes.len() > MAX_MANIFEST_BYTES {
-                return Err(fetch_too_large());
+            if bytes.len() > limit {
+                return Err(too_large());
             }
             Ok(bytes)
         }
@@ -696,6 +835,22 @@ fn fetch_error() -> ResolutionError {
         ErrorCategory::ManifestFetch,
         "release manifest could not be fetched from the node-authorized issuer catalog",
         true,
+    )
+}
+
+fn signature_fetch_error() -> ResolutionError {
+    ResolutionError::new(
+        ErrorCategory::ManifestFetch,
+        "release manifest signature could not be fetched from the node-authorized issuer catalog",
+        true,
+    )
+}
+
+fn signature_too_large() -> ResolutionError {
+    ResolutionError::new(
+        ErrorCategory::ManifestFetch,
+        "release manifest signature exceeds 4 KiB",
+        false,
     )
 }
 
@@ -742,6 +897,82 @@ mod tests {
 
     fn reference(bytes: &[u8]) -> ReleaseReference {
         ReleaseReference::parse_contract(&format!("test/agent@sha256:{}", digest(bytes))).unwrap()
+    }
+
+    fn policy_with_issuer(issuer: serde_json::Value) -> ResolverPolicy {
+        let mut base = serde_json::json!({
+            "source": { "kind": "https", "base_url": "https://releases.example" },
+            "allowed_releases": ["*"],
+            "caches": { "main": { "substituter": "https://cache.example" } },
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(issuer.as_object().unwrap().clone());
+        serde_json::from_value(serde_json::json!({
+            "system": "x86_64-linux",
+            "issuers": { "acme": base },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn issuers_must_choose_between_signing_keys_and_unsigned() {
+        let secret = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let key = crate::minisign::tests::public_key_line(&secret, *b"releases");
+        let rotated = crate::minisign::tests::public_key_line(
+            &ed25519_dalek::SigningKey::from_bytes(&[6; 32]),
+            *b"rotated1",
+        );
+        let diagnostic = |issuer| {
+            validate_policy(&policy_with_issuer(issuer), 0)
+                .err()
+                .map(|error| error.diagnostic)
+        };
+
+        assert_eq!(
+            diagnostic(serde_json::json!({ "signing_keys": [key] })),
+            None
+        );
+        assert_eq!(
+            diagnostic(serde_json::json!({ "signing_keys": [key, rotated] })),
+            None
+        );
+        assert_eq!(
+            diagnostic(serde_json::json!({ "allow_unsigned": true })),
+            None
+        );
+        assert!(diagnostic(serde_json::json!({}))
+            .unwrap()
+            .contains("no manifest signing keys"));
+        assert!(
+            diagnostic(serde_json::json!({ "signing_keys": [key], "allow_unsigned": true }))
+                .unwrap()
+                .contains("both")
+        );
+        assert!(diagnostic(serde_json::json!({ "signing_keys": ["RWQ"] }))
+            .unwrap()
+            .contains("not a minisign public key"));
+        assert!(
+            diagnostic(serde_json::json!({ "signing_keys": [key, key] }))
+                .unwrap()
+                .contains("one key id")
+        );
+        let digest = "a".repeat(64);
+        assert_eq!(
+            diagnostic(serde_json::json!({ "signing_keys": [key], "revoked_manifests": [digest] })),
+            None
+        );
+        for bad in [
+            "A".repeat(64),
+            format!("sha256:{}", "a".repeat(64)),
+            "a".repeat(63),
+        ] {
+            assert!(diagnostic(
+                serde_json::json!({ "signing_keys": [key], "revoked_manifests": [bad] })
+            )
+            .unwrap()
+            .contains("revoked manifest"),);
+        }
     }
 
     #[test]

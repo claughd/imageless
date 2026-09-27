@@ -18,6 +18,47 @@ const STORE_MOUNT_PATH: &str = "/nix/store/11111111111111111111111111111111-tool
 struct TestRelease {
     reference: String,
     policy: PathBuf,
+    catalog: PathBuf,
+    digest: String,
+}
+
+/// The issuer key every test catalog is signed with, and one the node does
+/// not trust.
+const TRUSTED_KEY: ([u8; 32], [u8; 8]) = ([3; 32], *b"trusted1");
+const UNTRUSTED_KEY: ([u8; 32], [u8; 8]) = ([4; 32], *b"stranger");
+
+fn signing_key((seed, _): ([u8; 32], [u8; 8])) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
+/// The key line `minisign -P` takes.
+fn minisign_public_key(key: ([u8; 32], [u8; 8])) -> String {
+    use base64::Engine as _;
+    let mut bytes = b"Ed".to_vec();
+    bytes.extend_from_slice(&key.1);
+    bytes.extend_from_slice(signing_key(key).verifying_key().as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A sidecar as `minisign -S` writes it: prehashed, with a trusted comment.
+fn minisign_signature(key: ([u8; 32], [u8; 8]), message: &[u8]) -> String {
+    use base64::Engine as _;
+    use blake2::Digest as _;
+    use ed25519_dalek::Signer as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let secret = signing_key(key);
+    let signature = secret.sign(&blake2::Blake2b512::digest(message)).to_bytes();
+    let mut line = b"ED".to_vec();
+    line.extend_from_slice(&key.1);
+    line.extend_from_slice(&signature);
+    let trusted = "timestamp:0\tfile:manifest.json";
+    let mut covered = signature.to_vec();
+    covered.extend_from_slice(trusted.as_bytes());
+    format!(
+        "untrusted comment: signature from minisign secret key\n{}\ntrusted comment: {trusted}\n{}\n",
+        engine.encode(line),
+        engine.encode(secret.sign(&covered).to_bytes()),
+    )
 }
 
 impl TestRelease {
@@ -68,6 +109,11 @@ impl TestRelease {
         std::fs::create_dir(&catalog).unwrap();
         let digest_directory = catalog.join("sha256");
         std::fs::create_dir(&digest_directory).unwrap();
+        std::fs::write(
+            digest_directory.join(format!("{digest}.json.minisig")),
+            minisign_signature(TRUSTED_KEY, &bytes),
+        )
+        .unwrap();
         std::fs::write(digest_directory.join(format!("{digest}.json")), bytes).unwrap();
 
         let policy = serde_json::json!({
@@ -78,9 +124,10 @@ impl TestRelease {
                 "test": {
                     "source": {
                         "kind": "local",
-                        "directory": std::fs::canonicalize(catalog).unwrap(),
+                        "directory": std::fs::canonicalize(&catalog).unwrap(),
                     },
                     "allowed_releases": ["rootfs"],
+                    "signing_keys": [minisign_public_key(TRUSTED_KEY)],
                     "caches": {
                         "local": {
                             "substituter": "file:///nix/store",
@@ -100,7 +147,23 @@ impl TestRelease {
         Self {
             reference: format!("test/rootfs@sha256:{digest}"),
             policy: policy_path,
+            catalog: std::fs::canonicalize(catalog).unwrap(),
+            digest,
         }
+    }
+
+    fn signature_path(&self) -> PathBuf {
+        self.catalog
+            .join("sha256")
+            .join(format!("{}.json.minisig", self.digest))
+    }
+
+    /// Rewrites one issuer policy field, keeping the file's mode.
+    fn set_issuer_policy(&self, field: &str, value: serde_json::Value) {
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&self.policy).unwrap()).unwrap();
+        policy["issuers"]["test"][field] = value;
+        std::fs::write(&self.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
     }
 
     fn annotations(&self) -> serde_json::Value {
@@ -967,5 +1030,100 @@ fn killing_resolver_kills_materializer_and_client_fails_closed() {
         assert!(started.elapsed() < Duration::from_secs(3));
         thread::sleep(Duration::from_millis(10));
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A release resolves only when its catalog carries a signature by a key node
+/// policy trusts for the issuer (SPEC §6.1). Every other release test runs
+/// with a signed catalog; this one takes the signature away piece by piece.
+#[test]
+fn releases_need_a_signature_from_a_key_the_node_trusts() {
+    let dir = temp_dir("release-signatures");
+    let release = TestRelease::new(&dir);
+    let manifest = std::fs::read(
+        release
+            .catalog
+            .join("sha256")
+            .join(format!("{}.json", release.digest)),
+    )
+    .unwrap();
+    let nix = dir.join("nix");
+    fake_nix(&nix, "true");
+    let delegate = dir.join("delegate");
+    executable(&delegate, "exit 0");
+
+    let attempt = |label: &str| {
+        let bundle = dir.join(label);
+        std::fs::create_dir(&bundle).unwrap();
+        write_config(&bundle, release.annotations());
+        // The daemon reads policy once, at start, so each attempt gets its
+        // own — and its own directory, so a new daemon never races the
+        // socket file the previous one left behind.
+        let run = dir.join(format!("{label}.run"));
+        std::fs::create_dir(&run).unwrap();
+        let resolver = ResolverProcess::start(&run, &nix, &release.policy);
+        let output = runc(&bundle, &delegate, &resolver.socket).output().unwrap();
+        drop(resolver);
+        output
+    };
+    let refused = |label: &str, diagnostic: &str| {
+        let output = attempt(label);
+        assert!(!output.status.success(), "{label} was admitted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(diagnostic), "{label}: {stderr}");
+    };
+
+    assert_success(&attempt("signed"));
+
+    std::fs::write(
+        release.signature_path(),
+        minisign_signature(UNTRUSTED_KEY, &manifest),
+    )
+    .unwrap();
+    refused(
+        "stranger",
+        "not signed by a key this node trusts for its issuer",
+    );
+
+    // The trusted key's id over another message: a signature for some other
+    // manifest copied beside this one.
+    std::fs::write(
+        release.signature_path(),
+        minisign_signature(TRUSTED_KEY, b"{}"),
+    )
+    .unwrap();
+    refused("transplanted", "release manifest signature does not verify");
+
+    std::fs::remove_file(release.signature_path()).unwrap();
+    refused(
+        "unsigned",
+        "release manifest signature could not be fetched",
+    );
+
+    // An issuer the operator marked unsigned needs no sidecar.
+    release.set_issuer_policy("signing_keys", serde_json::json!([]));
+    release.set_issuer_policy("allow_unsigned", serde_json::json!(true));
+    assert_success(&attempt("allowed-unsigned"));
+
+    // Revocation outranks everything, a valid signature included.
+    std::fs::write(
+        release.signature_path(),
+        minisign_signature(TRUSTED_KEY, &manifest),
+    )
+    .unwrap();
+    release.set_issuer_policy("allow_unsigned", serde_json::json!(false));
+    release.set_issuer_policy(
+        "signing_keys",
+        serde_json::json!([minisign_public_key(TRUSTED_KEY)]),
+    );
+    release.set_issuer_policy("revoked_manifests", serde_json::json!([release.digest]));
+    refused("revoked", "release manifest is revoked by node policy");
+    // Before anything is fetched: an unreachable catalog does not turn the
+    // refusal into a retryable fetch error.
+    std::fs::remove_file(release.signature_path()).unwrap();
+    refused(
+        "revoked-unreachable",
+        "release manifest is revoked by node policy",
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
