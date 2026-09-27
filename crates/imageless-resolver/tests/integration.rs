@@ -306,6 +306,9 @@ impl ResolverProcess {
             ])
             .env("IMAGELESS_NIX", nix)
             .env("IMAGELESS_NIX_STORE", nix)
+            // Never the node's real memo: a hit left by an earlier run would
+            // skip the evaluation these tests observe.
+            .env("IMAGELESS_EVALUATION_MEMO", "none")
             .stderr(Stdio::inherit());
         if let Some(user) = development_user {
             command.args([

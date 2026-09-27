@@ -130,10 +130,21 @@ impl Confinement {
         plan.directory(Path::new("/dev/pts"))?;
         plan.steps
             .push(Step::Devpts(c_path(&root.join("dev/pts"))?));
-        plan.steps.push(Step::Symlink {
-            target: c_path(Path::new("pts/ptmx"))?,
-            link: c_path(&root.join("dev/ptmx"))?,
-        });
+        // The links every OCI runtime puts in /dev. Builders rely on them:
+        // nixpkgs' patchelf hook reads a process substitution through
+        // /dev/fd, and fails every local build of a dynamic binary without it.
+        for (target, link) in [
+            ("pts/ptmx", "dev/ptmx"),
+            ("/proc/self/fd", "dev/fd"),
+            ("/proc/self/fd/0", "dev/stdin"),
+            ("/proc/self/fd/1", "dev/stdout"),
+            ("/proc/self/fd/2", "dev/stderr"),
+        ] {
+            plan.steps.push(Step::Symlink {
+                target: c_path(Path::new(target))?,
+                link: c_path(&root.join(link))?,
+            });
+        }
         // Never the host's /proc: in the host PID namespace its
         // /proc/<pid>/root links resolve against other processes' mount
         // namespaces — straight back to the host filesystem. `enter` mounts a
@@ -583,6 +594,8 @@ mod tests {
              && test ! -e '/proc/1/root{absent}' && test -d /proc/self \
              && test -c /dev/null && test ! -e /dev/mem && test ! -e /dev/sda \
              && test -c /dev/pts/ptmx && test -L /dev/ptmx \
+             && exec 3</dev/null && test -e /dev/fd/3 \
+             && test -L /dev/stdin && test -L /dev/stdout && test -L /dev/stderr \
              && ! sh -c 'echo x > /proc/sys/kernel/hostname' 2>/dev/null \
              && ! test -s /proc/kcore \
              && echo ok > /dev/null && touch '{allowed}/written'",

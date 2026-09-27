@@ -9,6 +9,7 @@ use crate::materialize::{
     ResolutionError, ResolutionSuccess, ResolutionTimings, ResolvePurpose, ResolveRequest,
     ResolveResponse,
 };
+use crate::memo;
 use crate::nix::{
     parse_materialized_path, run_command, run_command_confined, validate_realise_output,
 };
@@ -73,6 +74,9 @@ pub struct ResolverConfig {
     /// this; the daemon never does — it keeps requiring the unprivileged
     /// worker so evaluation cannot run with daemon privileges.
     pub evaluate_as_caller: bool,
+    /// Where evaluations of embedded seeds are memoized (`crate::memo`), or
+    /// `None` to evaluate every time.
+    pub evaluation_memo: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +113,7 @@ impl ResolverConfig {
             },
             development_worker: None,
             evaluate_as_caller: false,
+            evaluation_memo: crate::memo::evaluation_memo_from_environment(),
         }
     }
 }
@@ -723,6 +728,50 @@ impl Resolver {
         // why this gate relies on the confinement below rather than replacing
         // it: the refused fetch can reach nothing of the node's.
         let locked = staged_directory.is_some() && !policy.allow_unlocked_inputs;
+        // A locked seed's evaluation is a function of the staged bytes, the
+        // output, the system and the evaluator: answer a repeat from the memo.
+        // Only here, after every check above, so a memo hit never skips one.
+        let memo = match (
+            &staged_directory,
+            locked,
+            &self.inner.config.evaluation_memo,
+        ) {
+            (Some(directory), true, Some(memo_directory)) => {
+                let output = installable
+                    .rsplit_once('#')
+                    .map_or("", |(_, output)| output);
+                let key = StageClock::time(&clock.staging_us, || {
+                    memo::key(directory, output, &policy.system, &self.inner.config.nix)
+                });
+                match (memo::EvaluationMemo::open(memo_directory), key) {
+                    (Some(memo), Ok(key)) => Some((memo, key)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((memo, key)) = &memo {
+            if let Some(store_path) = memo.lookup(key) {
+                let registered = StageClock::time(&clock.root_registration_us, || {
+                    self.register_root(&store_path, &root, deadline)
+                });
+                match registered {
+                    Ok(_) => {
+                        return Ok(ResolvedRelease {
+                            identity: development_identity(installable),
+                            rootfs: store_path,
+                            process: None,
+                            mounts: Vec::new(),
+                        })
+                    }
+                    // No longer valid (collected, or never was): evaluate.
+                    Err(_) => {
+                        memo.forget(key);
+                        prepare_gc_root(&root)?;
+                    }
+                }
+            }
+        }
         let confinement_root = if policy.unconfined_evaluation {
             None
         } else {
@@ -851,6 +900,9 @@ impl Resolver {
         StageClock::time(&clock.root_registration_us, || {
             self.register_root(&store_path, &root, deadline)
         })?;
+        if let Some((memo, key)) = &memo {
+            memo.record(key, &store_path);
+        }
         Ok(ResolvedRelease {
             identity: development_identity(installable),
             rootfs: store_path,
@@ -1606,11 +1658,17 @@ fn local_lock_reason(locked: &serde_json::Value) -> Option<&'static str> {
     let field = |key: &str| locked.get(key).and_then(serde_json::Value::as_str);
     if field("type") == Some("path") {
         let path = field("path").unwrap_or("");
-        if path.starts_with('/') {
-            return Some("is an absolute path");
-        }
         if path.split('/').any(|part| part == "..") {
             return Some("escapes its flake with `..`");
+        }
+        // A store path pinned by its narHash is immutable, world-readable
+        // content that Nix verifies before use: not the node's to leak. That
+        // is how a flake locked against a local nixpkgs checkout records it.
+        let in_store = path
+            .strip_prefix("/nix/store/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('.'));
+        if path.starts_with('/') && !(in_store && field("narHash").is_some()) {
+            return Some("is an absolute path");
         }
     }
     if let Some(url) = field("url") {
@@ -2547,6 +2605,17 @@ rmdir "{state}/lock"
             "sub": { "locked": { "type": "path", "path": "./sub" }, "parent": [] },
         }))
         .is_ok());
+        // So is a store path pinned by its narHash, which Nix verifies: how a
+        // flake locked against a local nixpkgs checkout records it.
+        assert!(lock(serde_json::json!({
+            "root": { "inputs": { "nixpkgs": "nixpkgs" } },
+            "nixpkgs": { "locked": {
+                "type": "path",
+                "path": "/nix/store/00000000000000000000000000000000-source",
+                "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            } },
+        }))
+        .is_ok());
         for (locked, reason) in [
             (
                 serde_json::json!({ "type": "path", "path": "/srv/data" }),
@@ -2555,6 +2624,20 @@ rmdir "{state}/lock"
             (
                 serde_json::json!({ "type": "path", "path": "../../etc" }),
                 "escapes its flake",
+            ),
+            // Without the hash, a store path is just another node path, and a
+            // store-prefixed path may not climb out of the store.
+            (
+                serde_json::json!({ "type": "path", "path": "/nix/store/00000000000000000000000000000000-source" }),
+                "absolute path",
+            ),
+            (
+                serde_json::json!({ "type": "path", "path": "/nix/store/x/../../../etc", "narHash": "sha256-A=" }),
+                "escapes its flake",
+            ),
+            (
+                serde_json::json!({ "type": "path", "path": "/nix/store/", "narHash": "sha256-A=" }),
+                "absolute path",
             ),
             (
                 serde_json::json!({ "type": "git", "url": "file:///srv/repo" }),
@@ -2665,6 +2748,95 @@ rmdir "{state}/lock"
         // The build holds an indirect GC root until the bundle's exists.
         assert!(arguments.contains("--out-link"));
         assert!(!arguments.contains("--no-link"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_seed_is_answered_from_the_memo_without_nix() {
+        let dir = temporary("memo");
+        let source = dir.join("source");
+        std::fs::create_dir(&source).unwrap();
+        // Unique bytes: the memo is keyed by content, and no other test may
+        // share an entry with this one.
+        std::fs::write(
+            source.join("flake.nix"),
+            "{ outputs = _: { }; } # memo test",
+        )
+        .unwrap();
+        let policy = dir.join("policy.json");
+        std::fs::write(
+            &policy,
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{},"unconfined_evaluation":true}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let log = dir.join("eval-args");
+        let eval_nix = dir.join("fake-eval-nix");
+        crate::testutil::executable(
+            &eval_nix,
+            &format!(
+                "printf 'build\n' >> {log}\nprintf '%s\\n' {STORE}",
+                log = log.display()
+            ),
+        );
+        let config = |memo: &Path| {
+            let mut config = ResolverConfig::from_environment(2, 30);
+            config.nix = eval_nix.clone();
+            config.nix_store = fake_nix(&dir, "true");
+            config.policy = load_resolver_policy(&policy).unwrap();
+            config.evaluate_as_caller = true;
+            config.evaluation_memo = Some(memo.to_path_buf());
+            config
+        };
+        std::env::set_var("FAKE_STORE", STORE);
+        let memo_directory = dir.join("memo");
+        let resolver = Resolver::new(config(&memo_directory));
+        let resolve = |label: &str| {
+            let bundle = dir.join(label);
+            std::fs::create_dir(&bundle).unwrap();
+            let success = resolver
+                .resolve(request(
+                    bundle.clone(),
+                    Materialize::Flake(format!("path:{}#rootfs", source.display())),
+                    5000,
+                ))
+                .unwrap();
+            assert_eq!(success.rootfs, STORE);
+            assert_eq!(
+                std::fs::read_link(bundle.join(GC_ROOT_NAME)).unwrap(),
+                Path::new(STORE),
+                "a memo hit still roots the bundle"
+            );
+            std::fs::read_to_string(&log).unwrap().lines().count()
+        };
+
+        assert_eq!(resolve("first"), 1);
+        assert_eq!(resolve("restart"), 1, "the repeat never ran Nix");
+
+        // Any change to the seed is a different entry.
+        std::fs::write(
+            source.join("flake.nix"),
+            "{ outputs = _: { }; } # memo test 2",
+        )
+        .unwrap();
+        assert_eq!(resolve("edited"), 2);
+
+        // A seed that may lock its own inputs is not a function of its bytes.
+        let unlocked = {
+            let mut config = config(&memo_directory);
+            config.policy.allow_unlocked_inputs = true;
+            Resolver::new(config)
+        };
+        let bundle = dir.join("unlocked");
+        std::fs::create_dir(&bundle).unwrap();
+        unlocked
+            .resolve(request(
+                bundle,
+                Materialize::Flake(format!("path:{}#rootfs", source.display())),
+                5000,
+            ))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

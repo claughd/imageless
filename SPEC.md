@@ -116,10 +116,23 @@ An in-image flake evaluates against the lock it ships
 (`--no-update-lock-file`): a flake with inputs and no complete `flake.lock`
 fails the create, and a lock that pins a node-local input — an absolute or
 `..`-escaping `path`, or any `file:` URL — is refused before evaluation, naming
-the input. Development nodes may set `allow_unlocked_inputs: true` to let the
+the input. A `path` inside `/nix/store` locked by its `narHash` is not
+node-local: it is immutable, world-readable content that Nix verifies before
+use, and it is how a flake locked against a local nixpkgs checkout records
+that input. Development nodes may set `allow_unlocked_inputs: true` to let the
 node lock such a seed at evaluation time; confinement still applies. External
 references (§3) are confined the same way; their own lock is honored as
 written.
+
+A seed evaluated against its own lock is a function of the staged tree, the
+output, the node's system and the evaluator, so the reference runtime
+memoizes it. The key is a hash over those four. The value is the realised
+path, held by a GC root under `/nix/var/nix/gcroots/imageless-memo`. A
+repeat create (a restart, a replica) registers the bundle's root against the
+recorded path without running Nix. The memo is consulted only after every
+check above, keeps its 64 most recently used entries, and is never used for
+`allow_unlocked_inputs` or external references. `IMAGELESS_EVALUATION_MEMO`
+names another directory, or `none` to evaluate every time.
 
 ## 3. Annotations (highest precedence)
 

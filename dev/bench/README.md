@@ -62,11 +62,14 @@ dominates and splitting looks like it barely helps; on a real dependency tree
 the compile term is minutes and the split is the whole game. Reading the two
 terms separately is what tells you which case you are in.
 
-`restart` is the number to check first. It should be a small multiple of the
-evaluation cache hit, and it is only that fast because staged development
-sources are copied with a pinned mtime — a staged tree that differed only in
-timestamps would change the flake fingerprint and turn every restart into a
-cold evaluation.
+`restart` is the number to check first. A restart of a locked seed is
+answered from the node's evaluation memo (SPEC §2.4) without running Nix, so
+it costs staging, a content hash and the GC-root registration: 45–49 ms with
+`--modules 4 --functions 4`, against 1,435–1,503 ms with the memo off
+(`IMAGELESS_EVALUATION_MEMO=none`), which was Nix's own evaluation-cache hit.
+Set that to measure the path a node takes the first time it sees a seed. The
+memo keys on content, not timestamps, and staged sources keep a pinned mtime
+so Nix's fingerprint agrees.
 
 ## Believing the numbers
 
