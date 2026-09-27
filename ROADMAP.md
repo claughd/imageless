@@ -71,6 +71,10 @@ of arriving alongside the core the way they did in the incubation repo.
       v1.35.5+k3s1 / containerd 2.2.3: the seed pod, the plugin
       pack/push/apply path, and GC-while-running plus collect-after-delete.
       k3d and k3s releases on containerd 1.x are not covered.
+      On NixOS, `services.imageless.k3s.enable` writes the same drop-in
+      (both annotation families, `SystemdCgroup = true` for k3s as a systemd
+      unit) and puts the shim's environment on the `k3s` unit. The module
+      check evaluates it; no VM test in this repository boots it yet.
 - [x] **No hand-typed digests.** Optional catalog name/channel index
       (`refs/<name>/<channel>` → digest, client-side only; nodes ignore it)
       plus `kubectl imageless pin <issuer>/<name>` and pin-on-apply

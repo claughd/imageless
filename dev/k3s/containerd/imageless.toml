@@ -16,8 +16,9 @@ version = 3
   container_annotations = ["imageless.run/*"]
   [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless.options]
     BinaryName = "/usr/local/bin/imageless-runc"
-    # Tracks the node's cgroup driver: k3s without systemd-managed cgroups
-    # resolves its own runc handler to cgroupfs. Set true on a node where
-    # kubelet uses the systemd driver, or every pod on this handler fails at
-    # FailedCreatePodSandBox with no imageless diagnostic at all.
+    # Tracks the cgroup driver k3s picks for its own runc handler, or every
+    # pod on this handler fails at FailedCreatePodSandBox with no imageless
+    # diagnostic at all. k3s picks systemd only as a systemd unit
+    # (INVOCATION_ID set) with the cpuset controller and outside a user
+    # namespace; this recipe starts k3s from a shell, so cgroupfs.
     SystemdCgroup = false

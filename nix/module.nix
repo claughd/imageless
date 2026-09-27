@@ -79,6 +79,43 @@ let
       cfg.policy.issuers;
   };
   policyFile = pkgs.writeText "imageless-policy.json" (builtins.toJSON policy);
+
+  # containerd strips custom annotations from the container OCI spec unless
+  # the runtime handler allow-lists them.
+  annotations = [ "imageless.run/*" "run.imageless.*" ];
+
+  # What the engine that execs imageless-runc must carry: the shim inherits
+  # the environment of containerd, which on a k3s node is k3s itself.
+  engineService = {
+    path = [ cfg.package ];
+    restartTriggers = [ cfg.package policyFile ];
+    environment = {
+      IMAGELESS_REALIZATION_TIMEOUT_SECONDS = toString cfg.realizationTimeoutSeconds;
+      IMAGELESS_TELEMETRY_PATH = cfg.telemetryPath;
+      IMAGELESS_STORE_PROJECTION = cfg.storeProjection;
+    } // lib.optionalAttrs cfg.resolver.enable {
+      IMAGELESS_RESOLVER_SOCKET = cfg.resolver.socketPath;
+    };
+    requires = mkIf cfg.resolver.enable [ "imageless-resolver.service" ];
+    after = mkIf cfg.resolver.enable [ "imageless-resolver.service" ];
+  };
+
+  # k3s regenerates containerd's config.toml on every start, but the config it
+  # renders for containerd 2.x imports config-v3.toml.d/*.toml and containerd
+  # merges imported plugin tables into its own (dev/k3s/README.md). The
+  # handler therefore goes in a drop-in, and k3s's base config is untouched.
+  k3sDropIn = (pkgs.formats.toml { }).generate "imageless.toml" {
+    version = 3;
+    plugins."io.containerd.cri.v1.runtime".containerd.runtimes.${cfg.runtimeHandler} = {
+      runtime_type = "io.containerd.runc.v2";
+      pod_annotations = annotations;
+      container_annotations = annotations;
+      options = {
+        BinaryName = "${cfg.package}/bin/imageless-runc";
+        SystemdCgroup = cfg.k3s.systemdCgroup;
+      };
+    };
+  };
 in
 {
   options.services.imageless = {
@@ -159,13 +196,37 @@ in
 
     containerd.enable = mkOption {
       type = types.bool;
-      default = true;
+      default = !cfg.k3s.enable;
+      defaultText = lib.literalExpression "!config.services.imageless.k3s.enable";
       description = ''
         Register the runtime handler under containerd's stock io.containerd.runc.v2
         shim with BinaryName pointed at imageless-runc, and allow-list the
         imageless annotation namespaces. Disable when wiring a different
         engine (for example a Docker runtime) by hand.
       '';
+    };
+
+    k3s = {
+      enable = mkEnableOption ''
+        the runtime handler in the containerd that k3s embeds, through a
+        drop-in at /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/
+        (k3s releases on containerd 2.x). Servers and agents alike, since both
+        run containerd. Implies containerd.enable = false by default, because
+        the node's containerd is k3s's, not the NixOS one'';
+
+      systemdCgroup = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          SystemdCgroup for the handler's runc options. It must match the
+          cgroup driver k3s picks for its own runc handler, or every pod on
+          this handler fails at FailedCreatePodSandBox. k3s picks systemd
+          when it runs as a systemd unit (INVOCATION_ID set) on a host with
+          the cpuset controller, outside a user namespace, which is what
+          services.k3s gives on a cgroup v2 NixOS host. Set false when k3s
+          uses cgroupfs.
+        '';
+      };
     };
 
     resolver = {
@@ -190,6 +251,14 @@ in
       {
         assertion = cfg.policy.cacheOnly || cfg.policy.evalAllowedUriPrefixes != [ ];
         message = "services.imageless.policy.evalAllowedUriPrefixes must be non-empty when cacheOnly is false";
+      }
+      {
+        assertion = !cfg.k3s.enable || config.services.k3s.enable;
+        message = "services.imageless.k3s.enable requires services.k3s.enable";
+      }
+      {
+        assertion = !(cfg.k3s.enable && cfg.containerd.enable);
+        message = "services.imageless.k3s.enable and containerd.enable are exclusive: k3s runs its own containerd";
       }
     ] ++ lib.flatten (lib.mapAttrsToList
       (name: issuer: [
@@ -235,26 +304,23 @@ in
       settings.plugins."io.containerd.grpc.v1.cri".containerd.runtimes.${cfg.runtimeHandler} = {
         runtime_type = "io.containerd.runc.v2";
         options.BinaryName = "${cfg.package}/bin/imageless-runc";
-        # containerd strips custom annotations from the container OCI spec
-        # unless the runtime handler allow-lists them.
-        pod_annotations = [ "imageless.run/*" "run.imageless.*" ];
-        container_annotations = [ "imageless.run/*" "run.imageless.*" ];
+        pod_annotations = annotations;
+        container_annotations = annotations;
       };
     };
 
-    systemd.services.containerd = mkIf cfg.containerd.enable {
-      path = [ cfg.package ];
-      restartTriggers = [ cfg.package policyFile ];
-      environment = {
-        IMAGELESS_REALIZATION_TIMEOUT_SECONDS = toString cfg.realizationTimeoutSeconds;
-        IMAGELESS_TELEMETRY_PATH = cfg.telemetryPath;
-        IMAGELESS_STORE_PROJECTION = cfg.storeProjection;
-      } // lib.optionalAttrs cfg.resolver.enable {
-        IMAGELESS_RESOLVER_SOCKET = cfg.resolver.socketPath;
-      };
-      requires = mkIf cfg.resolver.enable [ "imageless-resolver.service" ];
-      after = mkIf cfg.resolver.enable [ "imageless-resolver.service" ];
+    systemd.services.containerd = mkIf cfg.containerd.enable engineService;
+
+    # A symlink into the store, the way services.k3s places its own
+    # containerd template; parent directories are created as needed.
+    systemd.tmpfiles.settings.imageless-k3s = mkIf cfg.k3s.enable {
+      "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/imageless.toml"."L+".argument =
+        "${k3sDropIn}";
     };
+
+    systemd.services.k3s = mkIf cfg.k3s.enable (engineService // {
+      restartTriggers = engineService.restartTriggers ++ [ k3sDropIn ];
+    });
 
     # The daemon refuses evaluation without an unprivileged worker, so the
     # development evaluator user exists exactly when the resolver may evaluate.

@@ -41,6 +41,12 @@ containerd, the bundles and the GC already share one mount namespace. That
 shared namespace is what the GC-root guarantee depends on: a live container
 survives `nix-collect-garbage`.
 
+**On NixOS, use the module instead of this script.** `services.imageless.k3s.enable`
+(next to `services.k3s.enable`) writes the same drop-in with both annotation
+families and `SystemdCgroup = true`, and puts the shim's environment on the
+`k3s` unit, whose containerd execs the shim. It turns the module's own
+containerd off, since the node's containerd is k3s's.
+
 ## 1. Prepare the node
 
 ```sh
@@ -145,8 +151,22 @@ relative `rootfs`.
   `--kubelet-arg=image-gc-high-threshold=100 --kubelet-arg=image-gc-low-threshold=99 '--kubelet-arg=eviction-hard=nodefs.available<1%,imagefs.available<1%'`,
   or use the registry path in step 4, which re-pulls instead of failing.
 - **`FailedCreatePodSandBox` on the imageless handler only.** The
-  `SystemdCgroup` value in `containerd/imageless.toml` does not match
-  kubelet's cgroup driver. Set it to `true` on a systemd-managed node.
+  `SystemdCgroup` value in `containerd/imageless.toml` does not match the
+  cgroup driver k3s chose for its own runc handler. k3s chooses systemd only
+  when it runs as a systemd unit (`INVOCATION_ID` is set), the cpuset
+  controller is present, and it is not in a user namespace. This recipe starts
+  k3s from a shell, so `false` is right here; set `true` for k3s under
+  systemd.
+- **`kubectl imageless run --external` fails, saying the annotation was
+  dropped.** The drop-in allow-lists `imageless.run/*` only, as
+  `dev/kind` does, so containerd strips `run.imageless.source`. Add
+  `"run.imageless.*"` to both annotation lists, and use a policy whose
+  prefixes cover the reference (`examples/external-refs-policy.json`).
+- **An agent exits with `flag provided but not defined`.** `disable` and
+  `tls-san` are server flags; keep them out of an agent's `config.yaml`.
+- **Agents dial the wrong API address.** With `node-external-ip` set, a
+  server advertises the API on that address unless `advertise-address` is
+  set too.
 - **Evaluation fails with `Operation not permitted`.** Node-side evaluation
   runs in a private mount namespace (SPEC §2.4). A host that forbids creating
   one must set `unconfined_evaluation` in its policy.

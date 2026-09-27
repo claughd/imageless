@@ -779,6 +779,18 @@
                   policy.evalAllowedUriPrefixes = [ "path:" ];
                 };
               };
+              k3s = evalNode {
+                services.k3s.enable = true;
+                services.imageless = {
+                  enable = true;
+                  k3s.enable = true;
+                  resolver.enable = true;
+                };
+              };
+              k3sDropIn = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/imageless.toml";
+              k3sHandler = (builtins.fromTOML (builtins.unsafeDiscardStringContext (builtins.readFile
+                k3s.systemd.tmpfiles.settings.imageless-k3s.${k3sDropIn}."L+".argument))
+              ).plugins."io.containerd.cri.v1.runtime".containerd.runtimes.imageless;
               runtime = daemonless.virtualisation.containerd.settings.plugins."io.containerd.grpc.v1.cri".containerd.runtimes.imageless;
             in
             assert lib.hasSuffix "/bin/imageless-runc" runtime.options.BinaryName;
@@ -801,6 +813,19 @@
             assert lib.hasInfix "--development-worker"
               daemon.systemd.services.imageless-resolver.serviceConfig.ExecStart;
             assert daemon.users.users ? imageless-dev;
+            # k3s mode: the handler lives in a drop-in k3s's containerd
+            # imports, the NixOS containerd stays off, and k3s (whose
+            # containerd execs the shim) carries the shim's environment.
+            assert !k3s.virtualisation.containerd.enable;
+            assert !(k3s.systemd.services ? containerd)
+              || !(k3s.systemd.services.containerd.environment ? IMAGELESS_TELEMETRY_PATH);
+            assert lib.hasSuffix "/bin/imageless-runc" k3sHandler.options.BinaryName;
+            assert k3sHandler.options.SystemdCgroup;
+            assert k3sHandler.pod_annotations == [ "imageless.run/*" "run.imageless.*" ];
+            assert k3sHandler.container_annotations == [ "imageless.run/*" "run.imageless.*" ];
+            assert k3s.systemd.services.k3s.environment.IMAGELESS_RESOLVER_SOCKET
+              == "/run/imageless/resolver.sock";
+            assert lib.elem "imageless-resolver.service" k3s.systemd.services.k3s.after;
             pkgs.writeText "imageless-module-eval" "ok";
           # dev/kind and dev/k3s are executable documentation; lint what can
           # drift: the setup scripts, the manifests, and the containerd patch

@@ -110,7 +110,8 @@ selection, recreate, GC-while-running, delete-and-collect, and reboot recovery
 on a real containerd/CRI node.
 
 See `examples/` for the RuntimeClass, pod, and containerd configs, and the
-NixOS module (`nixosModules.imageless`) for a packaged node setup. To try
+NixOS module (`nixosModules.imageless`) for a packaged node setup
+(`services.imageless.k3s.enable` on a k3s node). To try
 all of this locally, `dev/kind/` stands up a throwaway
 [kind](https://kind.sigs.k8s.io/) cluster wired for imageless — the
 five-minute path from nothing to a running flake on real Kubernetes,
