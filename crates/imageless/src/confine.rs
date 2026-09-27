@@ -270,6 +270,9 @@ impl Confinement {
             if child > 0 {
                 wait_and_mirror(child);
             }
+            // A fork clears the parent-death signal: re-arm it, so the
+            // evaluator — and with it the namespace — dies with its waiter.
+            check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
             // PID 1 of the new namespace: this procfs lists its own
             // processes, so /proc/<pid>/root never leaves the confined root.
             check(libc::mount(
@@ -279,8 +282,115 @@ impl Confinement {
                 libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                 std::ptr::null(),
             ))?;
+            harden_proc()?;
         }
         Ok(())
+    }
+}
+
+/// runc's default read-only procfs paths: a fresh procfs is still the kernel's,
+/// and a root process writing `/proc/sys/kernel/core_pattern` or
+/// `/proc/sysrq-trigger` acts on the host whatever its mount namespace.
+const PROC_READ_ONLY: &[&std::ffi::CStr] = &[
+    c"/proc/bus",
+    c"/proc/fs",
+    c"/proc/irq",
+    c"/proc/sys",
+    c"/proc/sysrq-trigger",
+];
+
+/// runc's default masked procfs files, which read kernel memory or state no
+/// evaluation needs: /dev/null is bound over each.
+const PROC_MASKED_FILES: &[&std::ffi::CStr] = &[
+    c"/proc/kcore",
+    c"/proc/keys",
+    c"/proc/latency_stats",
+    c"/proc/timer_list",
+    c"/proc/timer_stats",
+    c"/proc/sched_debug",
+];
+
+/// runc's default masked procfs directories: an empty read-only tmpfs each.
+const PROC_MASKED_DIRECTORIES: &[&std::ffi::CStr] =
+    &[c"/proc/acpi", c"/proc/asound", c"/proc/scsi"];
+
+/// Apply the read-only and masked procfs paths. Paths this kernel does not
+/// have are skipped. Syscalls only.
+unsafe fn harden_proc() -> io::Result<()> {
+    let absent = || io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT);
+    for path in PROC_READ_ONLY {
+        if libc::mount(
+            path.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        ) == -1
+        {
+            if absent() {
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        check(libc::mount(
+            std::ptr::null(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC,
+            std::ptr::null(),
+        ))?;
+    }
+    for path in PROC_MASKED_FILES {
+        if libc::mount(
+            c"/dev/null".as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ) == -1
+            && !absent()
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    for path in PROC_MASKED_DIRECTORIES {
+        if libc::mount(
+            c"tmpfs".as_ptr(),
+            path.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        ) == -1
+            && !absent()
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Close every descriptor above stderr. `close_range` where the kernel has it
+/// (5.9+); otherwise one close per possible descriptor, up to the limit.
+unsafe fn close_from_three() {
+    if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) == 0 {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let highest = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+        limit.rlim_cur.min(1 << 20) as libc::c_int
+    } else {
+        1024
+    };
+    for fd in 3..highest {
+        libc::close(fd);
     }
 }
 
@@ -294,7 +404,7 @@ impl Confinement {
 /// the parent-death signal the spawner installs after this returns in the
 /// child, taking the namespace with it.
 unsafe fn wait_and_mirror(child: libc::pid_t) -> ! {
-    libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+    close_from_three();
     libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     let mut status = 0;
     loop {
@@ -473,6 +583,8 @@ mod tests {
              && test ! -e '/proc/1/root{absent}' && test -d /proc/self \
              && test -c /dev/null && test ! -e /dev/mem && test ! -e /dev/sda \
              && test -c /dev/pts/ptmx && test -L /dev/ptmx \
+             && ! sh -c 'echo x > /proc/sys/kernel/hostname' 2>/dev/null \
+             && ! test -s /proc/kcore \
              && echo ok > /dev/null && touch '{allowed}/written'",
             present = allowed.join("present").display(),
             absent = hidden.join("absent").display(),
@@ -501,6 +613,60 @@ mod tests {
             }
             Err(error) => panic!("confined spawn failed: {error}"),
         }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The timeout's group kill must reach the forked evaluator, not just the
+    /// process `spawn` returned. Root-only, like the test above.
+    #[test]
+    fn a_timed_out_confined_command_leaves_nothing_running() {
+        let base = temporary("timeout");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let confinement = Confinement::prepare(&root, &[], &[]).unwrap();
+        // A distinctive argv, so the host's view of every PID namespace can
+        // be searched for survivors. setsid tries to leave the group as well.
+        // Built at run time, so no other command line on the host (a shell
+        // holding this source, say) can contain it.
+        let marker = format!("sleep 31.{}", std::process::id());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &format!("setsid {marker} & {marker}")]);
+        let started = std::time::Instant::now();
+        match crate::nix::run_command_confined(
+            &mut command,
+            std::time::Duration::from_millis(300),
+            Some(confinement),
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::EINVAL)
+                ) =>
+            {
+                eprintln!("skipping: cannot create a mount namespace here ({error})");
+                std::fs::remove_dir_all(base).unwrap();
+                return;
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let mut survivors = String::new();
+        for _ in 0..50 {
+            survivors = String::from_utf8_lossy(
+                &Command::new("pgrep")
+                    .args(["-f", &marker])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .into_owned();
+            if survivors.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(survivors.trim().is_empty(), "left running: {survivors}");
         std::fs::remove_dir_all(base).unwrap();
     }
 }

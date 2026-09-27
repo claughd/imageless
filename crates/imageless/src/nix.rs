@@ -56,6 +56,20 @@ pub(crate) fn validate_realise_output(
 }
 
 pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Result<String> {
+    run_command_confined(command, timeout, None)
+}
+
+/// [`run_command`], with the command's process first entering `confinement`.
+///
+/// Hook order is the point: the process-group and parent-death setup runs
+/// first, in the process `spawn` returns, so the evaluator that
+/// [`Confinement::enter`] forks inherits that group — and the timeout's group
+/// kill reaches it — instead of making a group of its own nobody kills.
+pub(crate) fn run_command_confined(
+    command: &mut Command,
+    timeout: Duration,
+    confinement: Option<crate::confine::Confinement>,
+) -> io::Result<String> {
     // Under `runc create` our stdin is the container's stdio: a Nix client,
     // fetcher, or credential prompt must never read bytes meant for the
     // workload, nor hold its pipe open after we return.
@@ -76,6 +90,11 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
             }
             Ok(())
         });
+        if let Some(confinement) = confinement {
+            // SAFETY: `enter` performs raw syscalls on data prepared before
+            // the fork and allocates nothing.
+            command.pre_exec(move || confinement.enter());
+        }
     }
     let mut child = command.spawn()?;
     let stdout = child

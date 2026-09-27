@@ -111,14 +111,17 @@ fn main() {
         imageless::Confinement::for_evaluation(root, &nix, &writable, &certificates)
             .and_then(|confinement| confinement.enter())
             .unwrap_or_else(|error| fail("confine evaluation", error));
+    }
+    drop_privileges(uid, gid).unwrap_or_else(|error| fail("drop privileges", error));
+    if confine_root.is_some() {
         // Only the forked evaluator (PID 1 of its namespace) gets here; the
-        // process the resolver spawned waits for it. Tie the evaluator to that
-        // process, so killing it tears the namespace down.
+        // process the resolver spawned waits for it. The kernel clears the
+        // parent-death signal on a credential change, so it is re-armed after
+        // the drop, not before: killing the waiter tears the namespace down.
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
             fail("set parent-death signal", std::io::Error::last_os_error());
         }
     }
-    drop_privileges(uid, gid).unwrap_or_else(|error| fail("drop privileges", error));
 
     let mut command = Command::new(nix);
     command

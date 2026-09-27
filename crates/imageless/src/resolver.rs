@@ -9,7 +9,9 @@ use crate::materialize::{
     ResolutionError, ResolutionSuccess, ResolutionTimings, ResolvePurpose, ResolveRequest,
     ResolveResponse,
 };
-use crate::nix::{parse_materialized_path, run_command, validate_realise_output};
+use crate::nix::{
+    parse_materialized_path, run_command, run_command_confined, validate_realise_output,
+};
 use crate::release::{self, CachePolicy, ReleaseReference, ResolvedRelease, ResolverPolicy};
 use crate::spec::{validate_output, validate_store_path};
 use crate::{
@@ -25,7 +27,6 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -736,6 +737,7 @@ impl Resolver {
         // block that follows.
         let mut _worker_cache = None;
         let mut _pending_root = None;
+        let mut confinement_plan = None;
         let stdout = {
             let _permit =
                 self.acquire_permit(deadline, "while waiting for a development Nix operation")?;
@@ -815,32 +817,29 @@ impl Resolver {
                                 false,
                             )
                         })?;
-                        // SAFETY: `enter` performs raw syscalls on data prepared
-                        // above and allocates nothing.
-                        unsafe {
-                            command.pre_exec(move || confinement.enter());
-                        }
+                        confinement_plan = Some(confinement);
                     }
                     command
                 }
             };
             let budget = remaining(deadline, "during development source evaluation")?;
-            StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget)).map_err(
-                |error| match error.kind() {
-                    io::ErrorKind::TimedOut => ResolutionError::timeout_with(
-                        "during development source evaluation",
-                        &error.to_string(),
+            StageClock::time(&clock.evaluation_us, || {
+                run_command_confined(&mut command, budget, confinement_plan.take())
+            })
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::TimedOut => ResolutionError::timeout_with(
+                    "during development source evaluation",
+                    &error.to_string(),
+                ),
+                _ => ResolutionError::new(
+                    ErrorCategory::Materialization,
+                    format!(
+                        "the development resolver could not evaluate the source: {error}{}",
+                        evaluation_hint(&error.to_string(), confinement_root.is_some())
                     ),
-                    _ => ResolutionError::new(
-                        ErrorCategory::Materialization,
-                        format!(
-                            "the development resolver could not evaluate the source: {error}{}",
-                            evaluation_hint(&error.to_string(), confinement_root.is_some())
-                        ),
-                        true,
-                    ),
-                },
-            )?
+                    true,
+                ),
+            })?
         };
         let store_path = parse_materialized_path(&stdout).map_err(|_| {
             ResolutionError::new(
