@@ -369,47 +369,58 @@ impl Resolver {
         let substitution_started = Instant::now();
 
         let key = request.materialize.key();
-        let (flight, leader) = {
-            let mut flights = self.inner.flights.lock().unwrap();
-            if let Some(flight) = flights.get(&key) {
-                flight.state.lock().unwrap().callers += 1;
-                (Arc::clone(flight), false)
+        let result = loop {
+            let (flight, leader) = self.join_flight(&key);
+            let result = if leader {
+                let result = self.materialize(
+                    &request.materialize,
+                    selected.as_ref(),
+                    &bundle,
+                    deadline,
+                    &clock,
+                );
+                // A failure is the leader's own: its deadline, its bundle, a
+                // fetch that may succeed a moment later. Unpublish the flight
+                // before waking anyone, so no later arrival joins a result that
+                // is already an error.
+                if result.is_err() {
+                    self.forget_flight(&key, &flight);
+                }
+                let mut state = flight.state.lock().unwrap();
+                state.result = Some(result.clone());
+                flight.ready.notify_all();
+                result
             } else {
-                let flight = Arc::new(Flight {
-                    state: Mutex::new(FlightState {
-                        callers: 1,
-                        result: None,
-                    }),
-                    ready: Condvar::new(),
-                });
-                flights.insert(key.clone(), Arc::clone(&flight));
-                (flight, true)
-            }
-        };
-
-        let result = if leader {
-            let result = self.materialize(
-                &request.materialize,
-                selected.as_ref(),
-                &bundle,
-                deadline,
-                &clock,
-            );
-            let mut state = flight.state.lock().unwrap();
-            state.result = Some(result.clone());
-            flight.ready.notify_all();
-            result
-        } else {
-            match wait_for_flight(&flight, deadline) {
-                Ok(resolution) => self.register_resolution(&resolution, &bundle, deadline, &clock),
-                Err(error) => Err(error),
+                match wait_for_flight(&flight, deadline) {
+                    Ok(resolution) => {
+                        self.register_resolution(&resolution, &bundle, deadline, &clock)
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            self.release_flight(&key, &flight);
+            // A follower that inherited a retryable failure — typically the
+            // leader running out of its own, shorter deadline — tries again on
+            // its own clock rather than failing with someone else's error. A
+            // policy or contract error is the same for every caller of this
+            // key, so it is shared as before. Rejoining can only make this
+            // caller a leader or a follower of a fresh flight, and leaders
+            // never loop, so each follower retries at most once per failure.
+            match &result {
+                Err(error)
+                    if !leader
+                        && error.retryable
+                        && remaining(deadline, "before retrying a failed realization").is_ok() =>
+                {
+                    continue
+                }
+                _ => break result,
             }
         };
 
         if result.is_err() {
             let _ = remove_bundle_gc_roots(&bundle);
         }
-        self.release_flight(&key, &flight);
         result.map(|resolution| ResolutionSuccess {
             resolution,
             timings: ResolutionTimings {
@@ -1291,6 +1302,36 @@ impl Resolver {
         })
     }
 
+    /// Join the in-progress flight for `key`, or publish a new one and lead it.
+    fn join_flight(&self, key: &str) -> (Arc<Flight>, bool) {
+        let mut flights = self.inner.flights.lock().unwrap();
+        if let Some(flight) = flights.get(key) {
+            flight.state.lock().unwrap().callers += 1;
+            return (Arc::clone(flight), false);
+        }
+        let flight = Arc::new(Flight {
+            state: Mutex::new(FlightState {
+                callers: 1,
+                result: None,
+            }),
+            ready: Condvar::new(),
+        });
+        flights.insert(key.to_string(), Arc::clone(&flight));
+        (flight, true)
+    }
+
+    /// Unpublish `flight` so the next caller for `key` starts a fresh one;
+    /// callers already waiting on it still receive its result.
+    fn forget_flight(&self, key: &str, flight: &Arc<Flight>) {
+        let mut flights = self.inner.flights.lock().unwrap();
+        if flights
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(key);
+        }
+    }
+
     fn release_flight(&self, key: &str, flight: &Arc<Flight>) {
         let remove = {
             let mut state = flight.state.lock().unwrap();
@@ -1298,13 +1339,7 @@ impl Resolver {
             state.callers == 0
         };
         if remove {
-            let mut flights = self.inner.flights.lock().unwrap();
-            if flights
-                .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, flight))
-            {
-                flights.remove(key);
-            }
+            self.forget_flight(key, flight);
         }
     }
 }
@@ -2210,10 +2245,10 @@ mod tests {
             leader.join().unwrap().unwrap_err().category,
             ErrorCategory::Materialization
         );
-        assert_eq!(
-            follower.unwrap_err().category,
-            ErrorCategory::Materialization
-        );
+        // The failure was the leader's (exit 7 is a retryable Materialization
+        // error): the follower retries on its own deadline instead of
+        // inheriting it, and the failed flight is gone for later callers.
+        assert_eq!(follower.unwrap().rootfs, STORE);
         assert_eq!(
             resolver
                 .resolve(request(two, Materialize::Closure(STORE.into()), 2000))
@@ -2660,6 +2695,53 @@ rmdir "{state}/lock"
             config.nix_store = nix_store.to_path_buf();
         }
         Resolver::new(config)
+    }
+
+    #[test]
+    fn a_follower_retries_a_retryable_failure_instead_of_inheriting_it() {
+        let dir = temporary("flight-retry");
+        let first = dir.join("first-call");
+        let eval_nix = dir.join("fake-eval-nix");
+        // The first evaluation fails (retryable: a Materialization error)
+        // after long enough for a second caller to join its flight; every
+        // later evaluation succeeds.
+        crate::testutil::executable(
+            &eval_nix,
+            &format!(
+                "if mkdir {first} 2>/dev/null; then sleep 1; echo transient >&2; exit 1; fi\n\
+                 printf '%s\\n' {STORE}",
+                first = first.display()
+            ),
+        );
+        std::env::set_var("FAKE_STORE", STORE);
+        let store_nix = fake_nix(&dir, "true");
+        let resolver =
+            evaluation_resolver(&["git+https://git.example/"], Some((&eval_nix, &store_nix)));
+        let installable = "git+https://git.example/app?rev=0123456789abcdef#rootfs";
+        let call = |label: &str| {
+            let bundle = dir.join(label);
+            std::fs::create_dir(&bundle).unwrap();
+            let resolver = resolver.clone();
+            std::thread::spawn(move || {
+                resolver.resolve_detailed(request(
+                    bundle,
+                    Materialize::Flake(installable.to_string()),
+                    10_000,
+                ))
+            })
+        };
+        let leader = call("leader");
+        std::thread::sleep(Duration::from_millis(300));
+        let follower = call("follower");
+        let leader = leader.join().unwrap();
+        let follower = follower.join().unwrap();
+        assert_eq!(leader.unwrap_err().category, ErrorCategory::Materialization);
+        let follower = follower.expect("the follower inherited the leader's failure");
+        assert_eq!(follower.resolution.rootfs, STORE);
+        // The roots point at a fake store path: look at the links themselves.
+        assert!(std::fs::symlink_metadata(dir.join("follower").join(GC_ROOT_NAME)).is_ok());
+        assert!(std::fs::symlink_metadata(dir.join("leader").join(GC_ROOT_NAME)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
