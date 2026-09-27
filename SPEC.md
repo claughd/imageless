@@ -32,7 +32,7 @@ An image opts in by carrying a flake at a conventional path in its layers:
 rootfs/
 └── etc/imageless/
     ├── flake.nix          # required for the zero-config path
-    ├── flake.lock         # optional, strongly recommended
+    ├── flake.lock         # required when the flake has inputs (§2.3)
     └── ...                # any source files the flake references
 ```
 
@@ -85,6 +85,30 @@ runtime reads the rootfs from the host, where an image symlink such as
 passes through any symlink fails the create. Zero-config discovery (§2.1) does
 not fail on a symlinked `etc` or `etc/imageless`; the image simply carries no
 embedded flake there and passes through.
+
+### 2.4 Evaluation confinement and locked inputs
+
+Staging bounds what the installable names; it cannot bound what the flake's own
+inputs name, and Nix fetches inputs — direct or transitive, `path:` and
+`file://` among them — from whatever filesystem the evaluator can see. The
+reference materializer therefore evaluates in a private mount namespace whose
+root holds only the store, the system program and library trees, the `/etc`
+entries Nix needs (its configuration, TLS roots, name resolution, account
+lookup), `/dev`, `/proc`, a private `/tmp`, the staged source, and the
+evaluator's fetcher cache. A node-local input resolves against that root and
+reaches nothing of the node's. A node that cannot create mount namespaces must
+say so in its policy (`unconfined_evaluation: true`); the default fails the
+create instead. TLS roots outside the allowlist must be named through
+`NIX_SSL_CERT_FILE`, which the evaluator binds.
+
+An in-image flake evaluates against the lock it ships
+(`--no-update-lock-file`): a flake with inputs and no complete `flake.lock`
+fails the create, and a lock that pins a node-local input — an absolute or
+`..`-escaping `path`, or any `file:` URL — is refused before evaluation, naming
+the input. Development nodes may set `allow_unlocked_inputs: true` to let the
+node lock such a seed at evaluation time; confinement still applies. External
+references (§3) are confined the same way; their own lock is honored as
+written.
 
 ## 3. Annotations (highest precedence)
 

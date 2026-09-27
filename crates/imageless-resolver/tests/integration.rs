@@ -113,6 +113,10 @@ impl TestRelease {
             "cache_only": false,
             "eval_allowed_uri_prefixes": ["path:"],
             "issuers": {},
+            // The fake Nix reports what it observed into this test's temp
+            // directory, which a confined evaluator cannot write. Confinement
+            // is exercised by the library's own test and the acceptance gates.
+            "unconfined_evaluation": true,
         });
         let path = dir.join("development-policy.json");
         std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();

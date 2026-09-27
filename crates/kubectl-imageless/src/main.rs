@@ -132,7 +132,8 @@ const USAGE: &str =
      \x20                       against — an https:// base URL or a local directory\n\
      \x20 --unpinned            allow an --external reference that pins nothing, or a\n\
      \x20                       generated flake that tracks nixos-unstable instead of\n\
-     \x20                       the pinned nixpkgs\n\
+     \x20                       the pinned nixpkgs (unlocked: a node refuses it unless\n\
+     \x20                       its policy sets allow_unlocked_inputs)\n\
      \x20 --image REF           an image the cluster can already pull (--external and\n\
      \x20                       --release only)\n\
      \x20 --name NAME           pod name (default: derived from the directory, or from\n\
@@ -825,8 +826,9 @@ fn run_packed(options: &RunOptions, path: &Path) -> ExitCode {
     }
     if !packed.has_lock {
         eprintln!(
-            "warning: {} has no flake.lock — the node will lock inputs at run time, so two\n\
-             runs of the same seed can materialize different closures; commit a flake.lock",
+            "warning: {} has no flake.lock — a node refuses a seed with inputs and no\n\
+             complete lock unless its policy sets allow_unlocked_inputs, and a node that\n\
+             locks at run time can materialize different closures; commit a flake.lock",
             directory.display()
         );
     }

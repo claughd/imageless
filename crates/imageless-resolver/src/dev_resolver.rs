@@ -4,6 +4,10 @@
 //! drops every group and user privilege, applies hard resource limits, clears
 //! its environment, and only then replaces itself with the configured Nix
 //! client. It never receives a bundle path and cannot register GC roots.
+//!
+//! With `--confine-root`, it first enters the evaluation confinement (while
+//! still root — building a mount namespace needs the privilege this process is
+//! about to drop), so no flake input can read the node's filesystem.
 
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
@@ -22,7 +26,8 @@ const MAX_PROCESSES: libc::rlim_t = 1024;
 fn usage() -> ! {
     eprintln!(
         "usage: imageless-dev-resolver --user USER --nix ABSOLUTE_PATH \
-         --cpu-seconds 1..3600 [--cache-home ABSOLUTE_PATH] --installable FLAKE#OUTPUT"
+         --cpu-seconds 1..3600 [--cache-home ABSOLUTE_PATH] [--confine-root ABSOLUTE_PATH] \
+         [--locked] --installable FLAKE#OUTPUT"
     );
     std::process::exit(2);
 }
@@ -37,6 +42,8 @@ fn main() {
     let mut cpu_seconds = None;
     let mut cache_home = None;
     let mut installable = None;
+    let mut confine_root: Option<PathBuf> = None;
+    let mut locked = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -47,6 +54,8 @@ fn main() {
             }
             "--cache-home" => cache_home = Some(PathBuf::from(value(&mut args))),
             "--installable" => installable = Some(value(&mut args)),
+            "--confine-root" => confine_root = Some(PathBuf::from(value(&mut args))),
+            "--locked" => locked = true,
             "--help" | "-h" => usage(),
             _ => usage(),
         }
@@ -62,9 +71,10 @@ fn main() {
     if !nix.is_absolute() || user.is_empty() || user.as_bytes().contains(&0) {
         usage();
     }
-    if cache_home
-        .as_ref()
-        .is_some_and(|cache_home| !cache_home.is_absolute())
+    if [&cache_home, &confine_root]
+        .into_iter()
+        .flatten()
+        .any(|path| !path.is_absolute())
     {
         usage();
     }
@@ -82,6 +92,24 @@ fn main() {
         .unwrap_or_else(|error| fail("limit open files", error));
     apply_limit(libc::RLIMIT_NPROC, MAX_PROCESSES, MAX_PROCESSES)
         .unwrap_or_else(|error| fail("limit processes", error));
+    if let Some(root) = &confine_root {
+        // The staged source is the one node path an in-image evaluation needs;
+        // the cache is the worker's scratch. Both keep their paths inside.
+        let mut writable: Vec<PathBuf> = installable
+            .strip_prefix("path:")
+            .and_then(|value| value.rsplit_once('#'))
+            .map(|(source, _)| PathBuf::from(source))
+            .into_iter()
+            .collect();
+        writable.extend(cache_home.clone());
+        let certificates: Vec<PathBuf> = option_env!("IMAGELESS_DEV_SSL_CERT_FILE")
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        imageless::Confinement::for_evaluation(root, &nix, &writable, &certificates)
+            .and_then(|confinement| confinement.enter())
+            .unwrap_or_else(|error| fail("confine evaluation", error));
+    }
     drop_privileges(uid, gid).unwrap_or_else(|error| fail("drop privileges", error));
 
     let mut command = Command::new(nix);
@@ -93,6 +121,7 @@ fn main() {
             "--no-link",
             "--print-out-paths",
         ])
+        .args(locked.then_some("--no-update-lock-file"))
         .arg(installable)
         .env_clear()
         .env("HOME", "/var/empty")

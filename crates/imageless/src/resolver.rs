@@ -2,6 +2,7 @@
 //! development-source staging pipeline, and the UNIX-socket server.
 
 use crate::client::{effective_uid, peer_allowed, peer_uid, read_frame, write_frame};
+use crate::confine::Confinement;
 use crate::gc::{gc_root_path, prepare_gc_root, remove_bundle_gc_roots, validate_registered_root};
 use crate::materialize::{
     elapsed_us, remaining, ClosurePathReport, ClosureReport, ErrorCategory, Materialize,
@@ -24,6 +25,7 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -101,6 +103,8 @@ impl ResolverConfig {
                 cache_only: true,
                 eval_allowed_uri_prefixes: Vec::new(),
                 issuers: HashMap::new(),
+                unconfined_evaluation: false,
+                allow_unlocked_inputs: false,
             },
             development_worker: None,
             evaluate_as_caller: false,
@@ -178,6 +182,8 @@ fn in_process_policy(
                         cache_only: true,
                         eval_allowed_uri_prefixes: Vec::new(),
                         issuers: HashMap::new(),
+                        unconfined_evaluation: false,
+                        allow_unlocked_inputs: false,
                     },
                     true,
                 )),
@@ -695,6 +701,21 @@ impl Resolver {
             .as_ref()
             .map(|(installable, _guard)| installable.as_str())
             .unwrap_or(installable);
+        let policy = &self.inner.config.policy;
+        let staged_directory = staged.as_ref().map(|(_, guard)| guard.directory.clone());
+        if let Some(directory) = &staged_directory {
+            refuse_local_locked_inputs(directory)?;
+        }
+        // An in-image flake evaluates against the lock it ships. Nix fetches an
+        // unlocked input before `--no-update-lock-file` refuses it, which is
+        // why this gate relies on the confinement below rather than replacing
+        // it: the refused fetch can reach nothing of the node's.
+        let locked = staged_directory.is_some() && !policy.allow_unlocked_inputs;
+        let confinement_root = if policy.unconfined_evaluation {
+            None
+        } else {
+            Some(create_confinement_root()?)
+        };
         let timeout = remaining(deadline, "before development source evaluation")?;
         let timeout_seconds = timeout.as_secs().max(1).to_string();
         // Guard slot, not dead code: the worker's cache directory must survive
@@ -720,20 +741,54 @@ impl Resolver {
                         .arg("--installable")
                         .arg(evaluation_installable)
                         .env_clear();
+                    if let Some(root) = &confinement_root {
+                        command.arg("--confine-root").arg(&root.directory);
+                    }
+                    if locked {
+                        command.arg("--locked");
+                    }
                     _worker_cache = Some(cache);
                     command
                 }
                 None => {
-                    let mut command = Command::new(&self.inner.config.nix);
-                    command
-                        .args([
-                            "--extra-experimental-features",
-                            "nix-command flakes",
-                            "build",
-                            "--no-link",
-                            "--print-out-paths",
-                        ])
-                        .arg(evaluation_installable);
+                    let nix = resolve_program(&self.inner.config.nix)?;
+                    let mut command = Command::new(&nix);
+                    command.args([
+                        "--extra-experimental-features",
+                        "nix-command flakes",
+                        "build",
+                        "--no-link",
+                        "--print-out-paths",
+                    ]);
+                    if locked {
+                        command.arg("--no-update-lock-file");
+                    }
+                    command.arg(evaluation_installable);
+                    if let Some(root) = &confinement_root {
+                        let certificates: Vec<PathBuf> = ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE"]
+                            .into_iter()
+                            .filter_map(std::env::var_os)
+                            .map(PathBuf::from)
+                            .collect();
+                        let confinement = Confinement::for_evaluation(
+                            &root.directory,
+                            &nix,
+                            staged_directory.as_slice(),
+                            &certificates,
+                        )
+                        .map_err(|error| {
+                            ResolutionError::new(
+                                ErrorCategory::Internal,
+                                format!("could not plan evaluation confinement: {error}"),
+                                false,
+                            )
+                        })?;
+                        // SAFETY: `enter` performs raw syscalls on data prepared
+                        // above and allocates nothing.
+                        unsafe {
+                            command.pre_exec(move || confinement.enter());
+                        }
+                    }
                     command
                 }
             };
@@ -746,7 +801,10 @@ impl Resolver {
                     ),
                     _ => ResolutionError::new(
                         ErrorCategory::Materialization,
-                        format!("the development resolver could not evaluate the source: {error}"),
+                        format!(
+                            "the development resolver could not evaluate the source: {error}{}",
+                            evaluation_hint(&error.to_string(), confinement_root.is_some())
+                        ),
                         true,
                     ),
                 },
@@ -1334,6 +1392,155 @@ fn validate_installable(installable: &str) -> Result<(), ResolutionError> {
         ));
     }
     Ok(())
+}
+
+/// An empty directory the evaluator's confined root is mounted over — inside
+/// the evaluator's own mount namespace only, so from here it stays empty and is
+/// removed when the evaluation is over.
+struct ConfinementRoot {
+    directory: PathBuf,
+}
+
+impl Drop for ConfinementRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+fn create_confinement_root() -> Result<ConfinementRoot, ResolutionError> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    for _ in 0..128 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!(".imageless-confine-{}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let guard = ConfinementRoot { directory: path };
+                std::fs::set_permissions(&guard.directory, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        ResolutionError::new(
+                            ErrorCategory::Internal,
+                            format!("could not prepare evaluation confinement: {error}"),
+                            true,
+                        )
+                    })?;
+                return Ok(guard);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ResolutionError::new(
+                    ErrorCategory::Internal,
+                    format!("could not prepare evaluation confinement: {error}"),
+                    true,
+                ))
+            }
+        }
+    }
+    Err(ResolutionError::new(
+        ErrorCategory::Internal,
+        "evaluation confinement namespace exhausted",
+        true,
+    ))
+}
+
+/// The confined root holds only absolute paths, so a bare program name is
+/// resolved against PATH here, where the host's PATH is still visible.
+fn resolve_program(program: &Path) -> Result<PathBuf, ResolutionError> {
+    if program.is_absolute() {
+        return Ok(program.to_path_buf());
+    }
+    if program.components().count() == 1 {
+        if let Some(found) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(program))
+                .find(|candidate| candidate.is_file())
+        }) {
+            return Ok(found);
+        }
+    }
+    Err(ResolutionError::new(
+        ErrorCategory::Internal,
+        format!("could not locate the Nix client `{}`", program.display()),
+        false,
+    ))
+}
+
+/// Point a failed evaluation at the node setting that explains it.
+fn evaluation_hint(error: &str, confined: bool) -> &'static str {
+    // Under confinement an unlocked local input fails while Nix is still
+    // locking it, before `--no-update-lock-file` gets to refuse the change.
+    if error.contains("requires lock file changes")
+        || error.contains("while updating the lock file")
+    {
+        "; an in-image flake with inputs must ship a complete flake.lock \
+         (or the node policy must set allow_unlocked_inputs)"
+    } else if confined && error.contains("Operation not permitted") {
+        "; evaluation runs in a private mount namespace, and a node that cannot \
+         create one must set unconfined_evaluation in its policy"
+    } else {
+        ""
+    }
+}
+
+/// Refuse a staged flake.lock that pins a node-local input: an absolute or
+/// `..`-escaping `path` input, or any `file:` URL. Such an input names the
+/// node's filesystem, which an image never controls (SPEC §2.3). Confinement
+/// already denies the read; this turns it into a diagnostic that names the
+/// input, before Nix runs.
+fn refuse_local_locked_inputs(directory: &Path) -> Result<(), ResolutionError> {
+    let bytes = match std::fs::read(directory.join("flake.lock")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(staging_error(error)),
+    };
+    let invalid =
+        |reason: String| ResolutionError::new(ErrorCategory::InvalidRequest, reason, false);
+    let lock: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("embedded flake.lock is not valid JSON".to_string()))?;
+    let nodes = lock
+        .get("nodes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| invalid("embedded flake.lock has no nodes".to_string()))?;
+    for (name, node) in nodes {
+        let Some(locked) = node.get("locked") else {
+            continue;
+        };
+        if let Some(reason) = local_lock_reason(locked) {
+            let name: String = name
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(64)
+                .collect();
+            return Err(invalid(format!(
+                "embedded flake.lock input `{name}` {reason}; an in-image flake may not lock \
+                 node-local inputs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn local_lock_reason(locked: &serde_json::Value) -> Option<&'static str> {
+    let field = |key: &str| locked.get(key).and_then(serde_json::Value::as_str);
+    if field("type") == Some("path") {
+        let path = field("path").unwrap_or("");
+        if path.starts_with('/') {
+            return Some("is an absolute path");
+        }
+        if path.split('/').any(|part| part == "..") {
+            return Some("escapes its flake with `..`");
+        }
+    }
+    if let Some(url) = field("url") {
+        if url.starts_with('/')
+            || url
+                .get(..5)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        {
+            return Some("is a local file URL");
+        }
+    }
+    None
 }
 
 struct StagedDevelopmentSource {
@@ -2235,6 +2442,86 @@ rmdir "{state}/lock"
     }
 
     #[test]
+    fn staged_locks_may_not_pin_node_local_inputs() {
+        let dir = temporary("staged-lock");
+        let lock = |nodes: serde_json::Value| {
+            std::fs::write(
+                dir.join("flake.lock"),
+                serde_json::to_vec(
+                    &serde_json::json!({ "nodes": nodes, "root": "root", "version": 7 }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            refuse_local_locked_inputs(&dir)
+        };
+        // No lock at all is the lock-less seed: gated by --no-update-lock-file
+        // under confinement, not here.
+        assert!(refuse_local_locked_inputs(&dir).is_ok());
+        // Remote inputs and in-tree relative subflakes are ordinary.
+        assert!(lock(serde_json::json!({
+            "root": { "inputs": { "nixpkgs": "nixpkgs", "sub": "sub" } },
+            "nixpkgs": { "locked": { "type": "github", "owner": "nixos", "repo": "nixpkgs", "rev": "0" } },
+            "sub": { "locked": { "type": "path", "path": "./sub" }, "parent": [] },
+        }))
+        .is_ok());
+        for (locked, reason) in [
+            (
+                serde_json::json!({ "type": "path", "path": "/srv/data" }),
+                "absolute path",
+            ),
+            (
+                serde_json::json!({ "type": "path", "path": "../../etc" }),
+                "escapes its flake",
+            ),
+            (
+                serde_json::json!({ "type": "git", "url": "file:///srv/repo" }),
+                "local file URL",
+            ),
+            (
+                serde_json::json!({ "type": "tarball", "url": "FILE:/srv/a.tar" }),
+                "local file URL",
+            ),
+            (
+                serde_json::json!({ "type": "git", "url": "/srv/repo" }),
+                "local file URL",
+            ),
+        ] {
+            let error = lock(serde_json::json!({
+                "root": { "inputs": { "data": "data" } },
+                "data": { "locked": locked, "flake": false },
+            }))
+            .unwrap_err();
+            assert_eq!(error.category, ErrorCategory::InvalidRequest);
+            assert!(error.diagnostic.contains("`data`"), "{}", error.diagnostic);
+            assert!(error.diagnostic.contains(reason), "{}", error.diagnostic);
+        }
+        std::fs::write(dir.join("flake.lock"), "{ not json").unwrap();
+        assert!(refuse_local_locked_inputs(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evaluation_failures_name_the_node_setting_that_explains_them() {
+        assert!(
+            evaluation_hint("flake 'path:/x' requires lock file changes", false)
+                .contains("allow_unlocked_inputs")
+        );
+        assert!(
+            evaluation_hint("… while updating the lock file of flake 'path:/x'", true)
+                .contains("allow_unlocked_inputs")
+        );
+        assert!(
+            evaluation_hint("Operation not permitted (os error 1)", true)
+                .contains("unconfined_evaluation")
+        );
+        assert_eq!(
+            evaluation_hint("Operation not permitted (os error 1)", false),
+            ""
+        );
+    }
+
+    #[test]
     fn in_process_policy_enables_caller_evaluation_without_a_worker() {
         let dir = temporary("in-process-eval");
         let bundle = dir.join("bundle");
@@ -2243,10 +2530,12 @@ rmdir "{state}/lock"
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("flake.nix"), "{ outputs = _: { }; }").unwrap();
 
+        // The fake evaluator logs its argv next to itself, which a confined
+        // evaluator cannot write; confinement has its own test.
         let policy = dir.join("policy.json");
         std::fs::write(
             &policy,
-            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{}}"#,
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{},"unconfined_evaluation":true}"#,
         )
         .unwrap();
         std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2289,6 +2578,8 @@ rmdir "{state}/lock"
         assert!(arguments.contains("--print-out-paths"));
         assert!(!arguments.contains("--user"));
         assert!(arguments.contains(".imageless-source-"));
+        // A staged in-image flake evaluates against the lock it ships.
+        assert!(arguments.contains("--no-update-lock-file"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2317,8 +2608,9 @@ rmdir "{state}/lock"
 
         // The same permissive policy, handed in inline rather than through a
         // file — no ownership check, and it authorizes exactly as the file did.
+        // Unconfined for the same reason as the file-policy test above.
         let inline = PolicySource::Inline(
-            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{}}"#
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{},"unconfined_evaluation":true}"#
                 .to_string(),
         );
         let success = resolve_in_process_at(
@@ -2359,6 +2651,8 @@ rmdir "{state}/lock"
             cache_only: false,
             eval_allowed_uri_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
             issuers: HashMap::new(),
+            unconfined_evaluation: true,
+            allow_unlocked_inputs: false,
         };
         config.evaluate_as_caller = true;
         if let Some((nix, nix_store)) = tools {
