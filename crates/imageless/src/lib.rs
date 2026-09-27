@@ -15,6 +15,7 @@ mod confine;
 mod gc;
 mod layer;
 mod materialize;
+mod memo;
 mod minisign;
 mod mounts;
 mod nix;
@@ -223,6 +224,7 @@ printf '%s\n' "$store_path"
             },
             development_worker: None,
             evaluate_as_caller: false,
+            evaluation_memo: None,
         })
     }
 
