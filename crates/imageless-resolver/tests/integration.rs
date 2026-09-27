@@ -1135,3 +1135,72 @@ fn releases_need_a_signature_from_a_key_the_node_trusts() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A pod sandbox names the pod's release before anything else exists, so its
+/// create starts realizing it (SPEC §4.1) while the sandbox itself is passed
+/// through untouched. The closure is rooted in the sandbox bundle.
+#[test]
+fn a_sandbox_create_prefetches_the_pods_release_in_the_background() {
+    let dir = temp_dir("sandbox-prefetch");
+    let release = TestRelease::new(&dir);
+    let nix = dir.join("nix");
+    fake_nix(&nix, "true");
+    let resolver = ResolverProcess::start(&dir, &nix, &release.policy);
+    let delegate = dir.join("delegate");
+    executable(&delegate, "exit 0");
+    let sandbox_annotations = serde_json::json!({
+        "io.kubernetes.cri.container-type": "sandbox",
+        "imageless.run/release-v1": release.reference,
+    });
+
+    let sandbox = dir.join("sandbox");
+    std::fs::create_dir(&sandbox).unwrap();
+    let config = write_config(&sandbox, sandbox_annotations.clone());
+    let original = std::fs::read(&config).unwrap();
+    let telemetry = dir.join("timings.jsonl");
+    let output = runc(&sandbox, &delegate, &resolver.socket)
+        .env("IMAGELESS_TELEMETRY_PATH", &telemetry)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        original,
+        "the sandbox is passed through"
+    );
+
+    let root = sandbox.join(imageless::GC_ROOT_NAME);
+    let started = Instant::now();
+    while !root.is_symlink() && started.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_link(&root).unwrap(), Path::new(STORE_PATH));
+    let started = Instant::now();
+    let event = loop {
+        let events = std::fs::read_to_string(&telemetry).unwrap_or_default();
+        if let Some(line) = events.lines().find(|line| line.contains("\"prefetch\"")) {
+            break serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no prefetch event: {events}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(event["release"], release.reference);
+    assert_eq!(event["outcome"], "success");
+
+    // Off means off.
+    let quiet = dir.join("quiet");
+    std::fs::create_dir(&quiet).unwrap();
+    write_config(&quiet, sandbox_annotations);
+    assert_success(
+        &runc(&quiet, &delegate, &resolver.socket)
+            .env("IMAGELESS_PREFETCH", "off")
+            .output()
+            .unwrap(),
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(!quiet.join(imageless::GC_ROOT_NAME).exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -1,9 +1,11 @@
 //! runc-compatible imageless interposer for Docker and other OCI callers.
 
 use imageless::{
-    export_timing_events, prepare_bundle, remove_bundle_gc_roots, root_layers_from_environment,
-    sweep_root_layers, PrepareBundle,
+    export_timing_events, prefetch_for_sandbox, prepare_bundle, remove_bundle_gc_roots,
+    root_layers_from_environment, sandbox_prefetch_request, sweep_root_layers, PrepareBundle,
+    PREFETCH_ENV,
 };
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -142,6 +144,49 @@ fn runtime_log(arguments: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn prefetch_enabled() -> bool {
+    nonempty(PREFETCH_ENV).as_deref() != Some("off")
+}
+
+/// Runs the sandbox prefetch detached: its own session, no stdio and no
+/// inherited descriptor, so neither the sandbox create nor the runtime that
+/// called it ever waits on it. Its outcome goes to telemetry; a failure costs
+/// nothing but the head start.
+fn spawn_prefetch(bundle: &Path) {
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .arg(PREFETCH_MODE)
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            // A runtime may hand this process descriptors it waits on (log
+            // and console pipes); the prefetch must hold none of them.
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            Ok(())
+        });
+    }
+    let _ = command.spawn();
+}
+
+fn prefetch(bundle: &Path) -> ! {
+    let mut prepare = PrepareBundle::new(bundle.join("config.json"), bundle);
+    prepare.timeout_seconds = timeout_seconds().unwrap_or(300);
+    let telemetry = nonempty(TELEMETRY_ENV).map(PathBuf::from);
+    let code = match prefetch_for_sandbox(&prepare, telemetry.as_deref()) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    };
+    std::process::exit(code)
+}
+
 /// runc's state directory: `--root`, or runc's default for root.
 fn runc_root(arguments: &[String]) -> PathBuf {
     PathBuf::from(global_flag(arguments, "root").unwrap_or("/run/runc"))
@@ -242,8 +287,18 @@ fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// argv[1] of the detached prefetch this binary spawns for a pod sandbox. No
+/// runtime passes it: runc has no such flag, so the dispatch cannot capture
+/// a real invocation.
+const PREFETCH_MODE: &str = "--imageless-prefetch";
+
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [mode, bundle] = arguments.as_slice() {
+        if mode == PREFETCH_MODE {
+            prefetch(Path::new(bundle));
+        }
+    }
     let bundle = canonical_bundle(&arguments).unwrap_or_else(|error| fail(error, 1));
     let mut applied = None;
     let mut original_config = None;
@@ -256,6 +311,18 @@ fn main() {
         // contract with the runtime that invoked it, and the library serves
         // embedders that have no argv at all.
         prepare.runtime_log = runtime_log(&arguments);
+        // A pod sandbox names the pod's release before anything else about
+        // the pod exists: start realizing it now, alongside the sandbox's own
+        // boot, networking and image pulls (SPEC §4.1).
+        if subcommand_index(&arguments).map(|index| arguments[index].as_str()) == Some("create")
+            && prefetch_enabled()
+            && matches!(
+                sandbox_prefetch_request(&prepare.config_path, bundle, prepare.timeout_seconds),
+                Ok(Some(_))
+            )
+        {
+            spawn_prefetch(bundle);
+        }
         // Read before preparation so a failed delegate can be undone; a bundle
         // without a readable config fails in preparation with its own error.
         original_config = std::fs::read(bundle.join("config.json")).ok();

@@ -4,12 +4,12 @@ use crate::client::{effective_uid, request_resolution_detailed};
 use crate::gc::remove_bundle_gc_roots;
 use crate::layer::{RootLayer, DEFAULT_ROOT_LAYER_DIRECTORY, ROOT_LAYER_DIRECTORY_ENV};
 use crate::materialize::{
-    elapsed_us, ErrorCategory, ResolutionError, ResolutionSuccess, ResolveRequest,
+    elapsed_us, ErrorCategory, Materialize, ResolutionError, ResolutionSuccess, ResolveRequest,
 };
 use crate::mounts::{apply_node_store_projection, apply_store_mounts, store_projection_for};
 use crate::release::{ProcessMetadata, ResolvedRelease};
 use crate::resolver::{resolve_in_process, PolicySource};
-use crate::spec::expansion_request;
+use crate::spec::{expansion_request, sandbox_prefetch_request};
 use crate::{to_io, StoreProjection};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -256,6 +256,51 @@ pub struct AppliedResolution {
 /// nothing touched. Both a standalone adapter and an embedding OCI runtime
 /// call this seam; a socket-backed caller never gains authority to execute
 /// Nix.
+/// `IMAGELESS_PREFETCH=off` disables sandbox prefetch; anything else, or
+/// unset, leaves it on.
+pub const PREFETCH_ENV: &str = "IMAGELESS_PREFETCH";
+
+/// Starts realizing a pod's release while its sandbox boots (SPEC §4.1): the
+/// sandbox is created before networking, image pulls and init containers,
+/// and the release is on its annotations already, so its closure can be
+/// substituted or built alongside all of that instead of after it. Returns
+/// the release identity when a prefetch ran, with its outcome recorded in
+/// telemetry; `None` for anything that is not such a sandbox.
+///
+/// Nothing depends on it succeeding. It roots the closure in the sandbox
+/// bundle — so it is pinned for the pod's lifetime and no longer — and a
+/// container's own create realizes whatever the prefetch did not, joining a
+/// download still in flight rather than repeating it.
+pub fn prefetch_for_sandbox(
+    prepare: &PrepareBundle,
+    telemetry: Option<&Path>,
+) -> io::Result<Option<String>> {
+    let Some(request) = sandbox_prefetch_request(
+        &prepare.config_path,
+        &prepare.bundle_path,
+        prepare.timeout_seconds,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Materialize::Release(reference) = &request.materialize else {
+        return Ok(None);
+    };
+    let identity = reference.identity();
+    let started = Instant::now();
+    let result = prepare.materializer.resolve(&request);
+    if let Some(path) = telemetry {
+        let _ = export_timing_events(
+            path,
+            &identity,
+            &[("prefetch", elapsed_us(started))],
+            Some(if result.is_ok() { "success" } else { "error" }),
+        );
+    }
+    result.map_err(|error| io::Error::other(format!("prefetch failed: {error}")))?;
+    Ok(Some(identity))
+}
+
 pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResolution>> {
     let selection_started = Instant::now();
     let request = match expansion_request(

@@ -303,6 +303,48 @@ pub(crate) fn validate_output(field: &'static str, output: &str) -> Result<(), C
     Ok(())
 }
 
+/// The prefetch a pod sandbox's create can start (SPEC §4.1): a prewarm of
+/// the release the pod names, rooted in the sandbox bundle so the closure is
+/// pinned for exactly the pod's lifetime. `None` for anything but a sandbox
+/// carrying a release, and for a pod that also names a development source,
+/// which its containers will refuse (SPEC §3). A malformed reference is not
+/// an error here: the sandbox is still passed through, and the containers'
+/// own creates report it.
+pub fn sandbox_prefetch_request(
+    config_path: &Path,
+    bundle_path: &Path,
+    timeout_seconds: u64,
+) -> io::Result<Option<ResolveRequest>> {
+    #[derive(Deserialize)]
+    struct AnnotationsOnly {
+        #[serde(default)]
+        annotations: HashMap<String, String>,
+    }
+    let spec: AnnotationsOnly = serde_json::from_slice(&std::fs::read(config_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let annotations = spec.annotations;
+    let sandbox = annotations
+        .get(CRI_CONTAINER_TYPE_ANNOTATION)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("sandbox"));
+    if !sandbox || annotations.contains_key(SOURCE_ANNOTATION) {
+        return Ok(None);
+    }
+    let Some(reference) = annotations
+        .get(RELEASE_ANNOTATION)
+        .and_then(|value| ReleaseReference::parse_contract(value).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ResolveRequest {
+        version: PROTOCOL_VERSION,
+        purpose: ResolvePurpose::Prewarm,
+        materialize: Materialize::Release(reference),
+        bundle_path: bundle_path.to_path_buf(),
+        timeout_ms: timeout_seconds.saturating_mul(1000),
+        container_name: None,
+    }))
+}
+
 pub fn expansion_request(
     config_path: &Path,
     bundle_path: &Path,
@@ -526,6 +568,56 @@ mod tests {
                 "expected {field} to be ignored"
             );
         }
+    }
+
+    #[test]
+    fn only_a_sandbox_naming_a_release_prefetches() {
+        let dir = std::env::temp_dir().join(format!("il-spec-prefetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        let release = "acme/api@sha256:".to_string() + &"a".repeat(64);
+        let request = |annotations: serde_json::Value| {
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({ "annotations": annotations })).unwrap(),
+            )
+            .unwrap();
+            sandbox_prefetch_request(&config, &dir, 30).unwrap()
+        };
+        let prefetch = request(serde_json::json!({
+            (CRI_CONTAINER_TYPE_ANNOTATION): "sandbox",
+            (RELEASE_ANNOTATION): release,
+        }))
+        .expect("a sandbox naming a release prefetches it");
+        assert_eq!(prefetch.purpose, ResolvePurpose::Prewarm);
+        assert_eq!(prefetch.container_name, None);
+        assert_eq!(prefetch.bundle_path, dir);
+        assert_eq!(prefetch.timeout_ms, 30_000);
+        assert!(matches!(prefetch.materialize, Materialize::Release(_)));
+
+        // A container is materialized by its own create, not prefetched.
+        assert!(request(serde_json::json!({
+            (CRI_CONTAINER_TYPE_ANNOTATION): "container",
+            (RELEASE_ANNOTATION): release,
+        }))
+        .is_none());
+        // Nothing to fetch, or nothing its containers would accept.
+        assert!(
+            request(serde_json::json!({ (CRI_CONTAINER_TYPE_ANNOTATION): "sandbox" })).is_none()
+        );
+        assert!(request(serde_json::json!({
+            (CRI_CONTAINER_TYPE_ANNOTATION): "sandbox",
+            (RELEASE_ANNOTATION): release,
+            (SOURCE_ANNOTATION): "github:acme/api",
+        }))
+        .is_none());
+        assert!(request(serde_json::json!({
+            (CRI_CONTAINER_TYPE_ANNOTATION): "sandbox",
+            (RELEASE_ANNOTATION): "not a reference",
+        }))
+        .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -204,7 +204,16 @@ A conforming runtime, at per-container `create`:
 
 1. **Selects or passes through.** A bundle with no embedded flake and no
    annotations proceeds unchanged. Passthrough must be a no-op: no
-   materializer contact, no bundle mutation.
+   materializer contact, no bundle mutation. One exception, which never
+   changes the create's outcome: a pod sandbox whose annotations name a
+   release may start realizing that release in the background (a
+   *prefetch*), so the download or build overlaps the sandbox's boot,
+   networking, image pulls and init containers. The sandbox's config is
+   untouched, and the prefetch pins what it realizes with GC roots in the
+   sandbox bundle, which live exactly as long as the pod. A prefetch that
+   fails costs nothing, because each container's create realizes what it
+   needs and joins a download still in flight. The reference runtime does
+   this unless `IMAGELESS_PREFETCH=off`.
 2. **Validates fail-closed.** Malformed metadata, invalid selectors, oversized
    values, or contradictory annotations (e.g. release + source) fail creation.
    The runtime must never delegate a partially rewritten spec.

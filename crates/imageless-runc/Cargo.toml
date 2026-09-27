@@ -20,3 +20,4 @@ inline-policy = ["imageless/inline-policy"]
 
 [dependencies]
 imageless = { path = "../imageless" }
+libc = "0.2"
