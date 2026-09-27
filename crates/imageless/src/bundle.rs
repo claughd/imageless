@@ -91,8 +91,10 @@ pub struct PrepareBundle {
     pub runtime_log: Option<PathBuf>,
     /// Where the writable mountpoint layer over the materialized root is
     /// staged (SPEC §4.5); `None` hands the store path to the runtime as the
-    /// root, which is only sound where the store is mounted read-only and the
-    /// root already holds every mountpoint the container needs.
+    /// root. That is sound for a runtime that never writes into `root.path`
+    /// because it builds its own root from it (an embedding sandbox, usually
+    /// with `runtime_supplies_store`), or where the store is mounted
+    /// read-only and the root already holds every mountpoint.
     pub root_layers: Option<PathBuf>,
     /// The runtime consuming this bundle projects `/nix/store` itself (SPEC
     /// §4 obligation 6, `runtime` mode), so the rewrite adds no store mount.

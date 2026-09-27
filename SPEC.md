@@ -247,8 +247,13 @@ A conforming runtime, at per-container `create`:
    in it), and is released after that. The reference runtime stages layers
    under a private mount point (`/run/imageless-roots`), ties each one to
    the runc state file of the container created over it, and releases it
-   once that state is gone. The layer is not a writable root, and a later
-   revision that offered one would be a new opt-in.
+   once that state is gone. A runtime that never writes into `root.path`,
+   because it builds its own root from the store path, needs no layer and
+   may be handed the store path directly. That is the reference
+   implementation's `root_layers: None`, verified by the store path still
+   passing `nix-store --verify-path` after workloads ran on a writable
+   store. The layer is not a writable root, and a later revision that
+   offered one would be a new opt-in.
 6. **Projects the store.** The realized closure must be visible to the
    container. Reference modes: `node` (bind the node's `/nix/store` read-only),
    `closure` (read-only bind mounts scoped to the closure of the realized
