@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const STORE_PATH: &str = "/nix/store/00000000000000000000000000000000-rootfs";
 const STORE_MOUNT_PATH: &str = "/nix/store/11111111111111111111111111111111-tools";
@@ -123,16 +123,17 @@ impl TestRelease {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
+    // The resolver binds `resolver.sock` in here, and sun_path holds 108 bytes.
+    // Outside the Nix sandbox (whose TMPDIR is a short /build) the temp dir is
+    // itself ~40 bytes, so the name stays compact: pid + counter is unique
+    // within a run, and a stale directory from a recycled pid is cleared.
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "imageless-cli-{label}-{}-{timestamp}-{}",
+        "il-{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }
