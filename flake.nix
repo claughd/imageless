@@ -333,12 +333,34 @@
             # must already exist in the materialized root.
             touch $out/etc/hostname $out/etc/hosts $out/etc/resolv.conf
           '';
-          smoke-release = pkgs.callPackage ./nix/release-catalog.nix {
+          smoke-release-unsigned = pkgs.callPackage ./nix/release-catalog.nix {
             rootfsTargets.${system} = smoke-rootfs;
             issuer = "imageless-smoke";
             releaseName = "cri";
             cache = "local";
           };
+          # Signed the way a publisher signs (SPEC.md §6.1): `minisign -S`
+          # beside the manifest. The key is a test key committed to this
+          # repository, which is only acceptable because nothing but this
+          # smoke trusts it; a real signing key never enters the Nix store.
+          smoke-release-public-key = builtins.elemAt
+            (lib.splitString "\n" (builtins.readFile ./nix/test-keys/release-smoke.pub)) 1;
+          imageless-sign-release = pkgs.callPackage ./nix/sign-release.nix { };
+          # Signed with the same tool a publisher runs, so this check exercises
+          # it end to end: copy out of the store, check digests, sign, verify.
+          smoke-release = pkgs.runCommand "imageless-release-imageless-smoke-signed"
+            {
+              nativeBuildInputs = [ imageless-sign-release ];
+              inherit (smoke-release-unsigned) passthru;
+            }
+            ''
+              imageless-sign-release --insecure-key-in-store \
+                --secret-key ${./nix/test-keys/release-smoke.key} \
+                --public-key ${./nix/test-keys/release-smoke.pub} \
+                --trusted-comment "imageless-smoke/cri" \
+                ${smoke-release-unsigned} $out
+              test -s $out/sha256/${smoke-release-unsigned.digest}.json.minisig
+            '';
           # Parameterized over containerd so the in-guest ctr client always
           # matches the node's daemon generation (a 2.x ctr against a 1.x
           # daemon would test client skew, not the runtime contract).
@@ -427,6 +449,7 @@
                         directory = smoke-release;
                       };
                       allowedReleases = [ "cri" ];
+                      signingKeys = [ smoke-release-public-key ];
                       caches.local = {
                         substituter = "file:///nix/store";
                         publicKeys = [ ];
@@ -646,6 +669,7 @@
           inherit docker-embedded-scenario docker-embedded-isolated;
           inherit docker-embedded-smoke imageless-cri-vm imageless-cri-vm-containerd1;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
+          inherit imageless-sign-release;
           inherit cri-embedded-seed cri-embedded-image;
           inherit stock-oci-smoke;
           default = imageless-runc;
@@ -779,6 +803,36 @@
                   policy.evalAllowedUriPrefixes = [ "path:" ];
                 };
               };
+              signingKey = "RWTZNBpKhXyctgMFuCJ6TzgLNLn0gAYuT1WOOc69Cc72tFLXKOvGtju0";
+              revoked = lib.strings.replicate 64 "a";
+              signed = evalNode {
+                services.imageless = {
+                  enable = true;
+                  policy.issuers.acme = {
+                    source = { kind = "https"; baseUrl = "https://releases.example"; };
+                    allowedReleases = [ "api" ];
+                    caches.main.substituter = "https://cache.example";
+                    signingKeys = [ signingKey ];
+                    revokedManifests = [ revoked ];
+                  };
+                };
+              };
+              signedPolicy = builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile
+                (lib.removePrefix "C+ /etc/imageless/policy.json - - - - "
+                  (lib.findFirst (lib.hasPrefix "C+ /etc/imageless/policy.json") null
+                    signed.systemd.tmpfiles.rules))));
+              k3s = evalNode {
+                services.k3s.enable = true;
+                services.imageless = {
+                  enable = true;
+                  k3s.enable = true;
+                  resolver.enable = true;
+                };
+              };
+              k3sDropIn = "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/imageless.toml";
+              k3sHandler = (builtins.fromTOML (builtins.unsafeDiscardStringContext (builtins.readFile
+                k3s.systemd.tmpfiles.settings.imageless-k3s.${k3sDropIn}."L+".argument))
+              ).plugins."io.containerd.cri.v1.runtime".containerd.runtimes.imageless;
               runtime = daemonless.virtualisation.containerd.settings.plugins."io.containerd.grpc.v1.cri".containerd.runtimes.imageless;
             in
             assert lib.hasSuffix "/bin/imageless-runc" runtime.options.BinaryName;
@@ -801,6 +855,24 @@
             assert lib.hasInfix "--development-worker"
               daemon.systemd.services.imageless-resolver.serviceConfig.ExecStart;
             assert daemon.users.users ? imageless-dev;
+            # Issuer signing policy reaches the node file under the names the
+            # resolver reads (SPEC.md §6.1).
+            assert signedPolicy.issuers.acme.signing_keys == [ signingKey ];
+            assert signedPolicy.issuers.acme.allow_unsigned == false;
+            assert signedPolicy.issuers.acme.revoked_manifests == [ revoked ];
+            # k3s mode: the handler lives in a drop-in k3s's containerd
+            # imports, the NixOS containerd stays off, and k3s (whose
+            # containerd execs the shim) carries the shim's environment.
+            assert !k3s.virtualisation.containerd.enable;
+            assert !(k3s.systemd.services ? containerd)
+              || !(k3s.systemd.services.containerd.environment ? IMAGELESS_TELEMETRY_PATH);
+            assert lib.hasSuffix "/bin/imageless-runc" k3sHandler.options.BinaryName;
+            assert k3sHandler.options.SystemdCgroup;
+            assert k3sHandler.pod_annotations == [ "imageless.run/*" "run.imageless.*" ];
+            assert k3sHandler.container_annotations == [ "imageless.run/*" "run.imageless.*" ];
+            assert k3s.systemd.services.k3s.environment.IMAGELESS_RESOLVER_SOCKET
+              == "/run/imageless/resolver.sock";
+            assert lib.elem "imageless-resolver.service" k3s.systemd.services.k3s.after;
             pkgs.writeText "imageless-module-eval" "ok";
           # dev/kind and dev/k3s are executable documentation; lint what can
           # drift: the setup scripts, the manifests, and the containerd patch

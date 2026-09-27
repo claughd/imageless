@@ -71,6 +71,14 @@ of arriving alongside the core the way they did in the incubation repo.
       v1.35.5+k3s1 / containerd 2.2.3: the seed pod, the plugin
       pack/push/apply path, and GC-while-running plus collect-after-delete.
       k3d and k3s releases on containerd 1.x are not covered.
+      Pods keep Kubernetes' default service-account token: runc's
+      mountpoints go to a per-container overlay layer over the store path
+      (SPEC §4.5), found when imgless's NixOS VM test hit the read-only
+      store. Earlier builds wrote those mountpoints into writable store paths.
+      On NixOS, `services.imageless.k3s.enable` writes the same drop-in
+      (both annotation families, `SystemdCgroup = true` for k3s as a systemd
+      unit) and puts the shim's environment on the `k3s` unit. The module
+      check evaluates it; no VM test in this repository boots it yet.
 - [x] **No hand-typed digests.** Optional catalog name/channel index
       (`refs/<name>/<channel>` → digest, client-side only; nodes ignore it)
       plus `kubectl imageless pin <issuer>/<name>` and pin-on-apply
@@ -121,9 +129,15 @@ nodes), so its hardening is committed work, paced by that deployment:
 - [ ] Threat-model document: compromised workloads, malicious caches, staging
       abuse, reboot cleanup; move the development evaluator into a dedicated
       service cgroup rather than UID-wide rlimits.
-- [ ] Detached signatures over canonical manifest bytes (minisign-style), with
-      node-owned issuer keys, rotation, revocation, and compromised-catalog
-      recovery. Digest integrity exists today; authenticity does not.
+- [x] Detached signatures over canonical manifest bytes (SPEC §6.1): stock
+      minisign sidecars (`sha256/<digest>.json.minisig`), node-owned keys per
+      issuer, signatures required unless an issuer is explicitly
+      `allow_unsigned`, several keys at once for rotation, and
+      `revoked_manifests` for signed releases a node must still refuse.
+      Verified against minisign 0.12's own output and through the resolver
+      daemon's refusal paths. The CRI VM gate now signs its catalog, but it
+      has not been booted since, because the environment that wrote this
+      had no KVM.
 - [ ] Private/authorized cache access without distributing cache credentials to
       workloads.
 - [ ] Enough recorded evaluation/build input to reproduce a release after cache

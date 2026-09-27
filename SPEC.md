@@ -209,11 +209,29 @@ A conforming runtime, at per-container `create`:
    needs writable paths gets them from mounts (`tmpfs`, volumes), never from
    the root. Process metadata is only applied when the release manifest
    explicitly requests it.
-5. **Projects the store.** The realized closure must be visible to the
+5. **Never lets the OCI runtime write into the store.** An OCI runtime
+   creates the destination of every mount inside the root before mounting
+   over it: `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`, a
+   service-account token directory, any volume. A store path can take none of
+   those writes. Where the store is read-only (NixOS, and any hardened node)
+   the create fails. Where it is writable, the runtime modifies a store path
+   in place, which invalidates its hash for every container and the node. So
+   `root.path` names a **mountpoint layer**: an overlay whose only lower
+   layer is the realized store path, with a small upper layer private to
+   the container that receives the runtime's mountpoints and nothing else,
+   because the root is still made read-only before the workload runs. The
+   layer stays mounted at its node path until the container is deleted,
+   because the OCI runtime keeps using that path (runc starts every `exec`
+   in it), and is released after that. The reference runtime stages layers
+   under a private mount point (`/run/imageless-roots`), ties each one to
+   the runc state file of the container created over it, and releases it
+   once that state is gone. The layer is not a writable root, and a later
+   revision that offered one would be a new opt-in.
+6. **Projects the store.** The realized closure must be visible to the
    container. Reference modes: `node` (bind the node's `/nix/store` read-only)
    or `closure` (read-only bind mounts scoped to the closure of the realized
    root, computed by the materializer).
-6. **Holds GC roots for the container's lifetime.** Materialization registers
+7. **Holds GC roots for the container's lifetime.** Materialization registers
    Nix GC roots tied to the bundle (`.imageless-rootfs-gcroot`,
    `.imageless-store-gcroots/`). Roots are released when creation fails, the
    delegate exits unsuccessfully, or the container is deleted. A live container
@@ -278,9 +296,50 @@ the catalog actually holds — a client learns that when the fetch of
 The publisher that produces manifests is out of scope for this spec; any CI
 that can copy a Nix closure to a cache and emit the manifest JSON conforms.
 
-Non-normative reservation: a future revision is expected to add detached
-signatures over the canonical manifest bytes as `sha256/<digest>.json.minisig`
-sidecars. Catalogs should not use that name for anything else.
+### 6.1 Manifest signatures
+
+The digest proves the manifest is the one the pod named. It does not prove the
+issuer published it: whoever can write a catalog can add a manifest under any
+release name, with any entrypoint, environment, and store paths the cache
+holds. Signatures close that gap.
+
+- A signature is a detached [minisign](https://jedisct1.github.io/minisign/)
+  signature over the manifest's exact bytes, published beside it as
+  `sha256/<digest>.json.minisig` and bounded to 4 KiB. Both minisign
+  algorithms are accepted: `ED` (over the BLAKE2b-512 hash, what `minisign -S`
+  writes) and legacy `Ed`. The global signature over the trusted comment MUST
+  verify too; nothing in either comment is interpreted.
+- Node policy lists, per issuer, the public keys it accepts for that issuer.
+  A key trusted for one issuer never authenticates another issuer's manifest,
+  because the manifest's `issuer` must match the reference (§6).
+- A node MUST refuse a release whose issuer has keys configured unless the
+  sidecar verifies under one of them. An issuer with no keys is accepted
+  unsigned only where node policy says so explicitly; the reference
+  implementation requires `allow_unsigned: true` for that and refuses a
+  policy that sets neither.
+- A node MAY refuse specific digests (`revoked_manifests` in the reference
+  policy) even when they are validly signed.
+
+The sidecar is not covered by the digest, so it can be replaced without
+changing any reference. That is what makes the procedures below possible:
+
+- **Rotation.** Add the new key to every node's policy, re-sign the live
+  manifests with it (replacing their sidecars), then remove the old key.
+  Until the last step, both keys verify.
+- **A compromised signing key.** Rotate as above, and remove the old key at
+  once rather than last. Releases not yet re-signed stop resolving on nodes
+  that have dropped the key; nothing an attacker signed with it resolves
+  anywhere.
+- **A compromised catalog, keys intact.** The attacker cannot add a release a
+  node will run. They can delete manifests or sidecars (denial of service),
+  and they can re-point a channel at an older release the issuer really
+  signed. Pins taken from the catalog after the compromise deserve review;
+  a withdrawn release belongs in `revoked_manifests`.
+
+Signing is the publisher's job and needs only the stock tool, for example
+`minisign -S -s issuer.key -m sha256/<digest>.json`. The signing key never
+belongs on a node, in a Nix store, or anywhere a pull request's build can
+read it.
 
 ## 7. Conformance
 
@@ -323,7 +382,8 @@ deployer, or runtime can observe:
   GC-root names (`.imageless-rootfs-gcroot`, `.imageless-store-gcroots/`).
 - The release profile (§6): the `imageless.release.v1` manifest schema,
   canonical-JSON digest addressing, the `sha256/<digest>.json` catalog layout
-  and 64 KiB manifest cap, and the `refs/<name>/<channel>` index rules.
+  and 64 KiB manifest cap, the `refs/<name>/<channel>` index rules, and the
+  `sha256/<digest>.json.minisig` signature sidecar (§6.1).
 
 Explicitly **not** part of the frozen surface:
 

@@ -41,6 +41,12 @@ containerd, the bundles and the GC already share one mount namespace. That
 shared namespace is what the GC-root guarantee depends on: a live container
 survives `nix-collect-garbage`.
 
+**On NixOS, use the module instead of this script.** `services.imageless.k3s.enable`
+(next to `services.k3s.enable`) writes the same drop-in with both annotation
+families and `SystemdCgroup = true`, and puts the shim's environment on the
+`k3s` unit, whose containerd execs the shim. It turns the module's own
+containerd off, since the node's containerd is k3s's.
+
 ## 1. Prepare the node
 
 ```sh
@@ -135,6 +141,31 @@ Read the root path from the bundle's `config.json`. `crictl inspect` shows
 containerd's spec before the rewrite, where the root path is still the
 relative `rootfs`.
 
+## Check that the store stayed intact
+
+The root a pod runs on is an overlay whose only lower layer is the store path
+(SPEC §4.5). The OCI runtime's mountpoints, such as `/etc/hosts` and the
+service-account token, land in a small per-container upper layer and never
+in the store:
+
+```sh
+store=$(readlink /run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/$cid/.imageless-rootfs-gcroot)
+nix-store --verify-path "$store" && echo "store path unmodified"
+```
+
+Builds before this layer existed let runc create those mountpoints inside
+the store path itself. On a read-only store (NixOS) that failed the create
+with `mkdirat …: read-only file system`. On a writable one it succeeded and
+modified the store path. `nix-store --verify --check-contents` reports paths
+modified that way, and `nix-store --repair-path <path>` restores them.
+
+The recipe was re-run with the store bind-mounted read-only, as NixOS mounts
+it, and a pod that keeps Kubernetes' default service-account token. The pod
+served, the token and `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf`
+were in place, `kubectl exec` worked, and the store path verified clean. The
+layer, one tmpfs and one overlay under `/run/imageless-roots`, was released
+when the pod was deleted. The GC checks in step 5 held too.
+
 ## Troubleshooting on unusual hosts
 
 - **`ErrImageNeverPull` after an import that succeeded.** Kubelet's image GC
@@ -145,8 +176,22 @@ relative `rootfs`.
   `--kubelet-arg=image-gc-high-threshold=100 --kubelet-arg=image-gc-low-threshold=99 '--kubelet-arg=eviction-hard=nodefs.available<1%,imagefs.available<1%'`,
   or use the registry path in step 4, which re-pulls instead of failing.
 - **`FailedCreatePodSandBox` on the imageless handler only.** The
-  `SystemdCgroup` value in `containerd/imageless.toml` does not match
-  kubelet's cgroup driver. Set it to `true` on a systemd-managed node.
+  `SystemdCgroup` value in `containerd/imageless.toml` does not match the
+  cgroup driver k3s chose for its own runc handler. k3s chooses systemd only
+  when it runs as a systemd unit (`INVOCATION_ID` is set), the cpuset
+  controller is present, and it is not in a user namespace. This recipe starts
+  k3s from a shell, so `false` is right here; set `true` for k3s under
+  systemd.
+- **`kubectl imageless run --external` fails, saying the annotation was
+  dropped.** The drop-in allow-lists `imageless.run/*` only, as
+  `dev/kind` does, so containerd strips `run.imageless.source`. Add
+  `"run.imageless.*"` to both annotation lists, and use a policy whose
+  prefixes cover the reference (`examples/external-refs-policy.json`).
+- **An agent exits with `flag provided but not defined`.** `disable` and
+  `tls-san` are server flags; keep them out of an agent's `config.yaml`.
+- **Agents dial the wrong API address.** With `node-external-ip` set, a
+  server advertises the API on that address unless `advertise-address` is
+  set too.
 - **Evaluation fails with `Operation not permitted`.** Node-side evaluation
   runs in a private mount namespace (SPEC §2.4). A host that forbids creating
   one must set `unconfined_evaluation` in its policy.
