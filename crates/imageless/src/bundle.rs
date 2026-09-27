@@ -385,6 +385,11 @@ pub fn apply_resolution_with_projection(
         "path".into(),
         serde_json::Value::String(resolution.rootfs.clone()),
     );
+    // The new root is a store path shared with every other container and the
+    // node itself (SPEC §4.4): a writable root would let one workload rewrite
+    // what all of them run, wherever the node's /nix/store is not itself
+    // mounted read-only.
+    root.insert("readonly".into(), serde_json::Value::Bool(true));
 
     if let Some(metadata) = &resolution.process {
         apply_process_metadata(&mut document, metadata)?;
@@ -838,6 +843,28 @@ mod tests {
         let result = prepare_bundle(&prepare).unwrap();
         assert!(result.is_none());
         assert_eq!(std::fs::read(&config).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewrite_forces_the_shared_store_root_read_only() {
+        let dir = temporary("readonly-root");
+        let config = dir.join("config.json");
+        for root in [
+            serde_json::json!({ "path": "rootfs" }),
+            serde_json::json!({ "path": "rootfs", "readonly": false }),
+        ] {
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({ "root": root })).unwrap(),
+            )
+            .unwrap();
+            rewrite_root_path(&config, STORE).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+            assert_eq!(value["root"]["path"], STORE);
+            assert_eq!(value["root"]["readonly"], true);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
