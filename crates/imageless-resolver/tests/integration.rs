@@ -813,13 +813,24 @@ fn delegate_or_rewrite_failure_removes_new_root() {
 
     let delegated = dir.join("delegated");
     std::fs::create_dir(&delegated).unwrap();
-    write_config(&delegated, release.annotations());
+    let config = write_config(&delegated, release.annotations());
+    let engine_config = std::fs::read(&config).unwrap();
     let output = runc(&delegated, &failing_delegate, &resolver.socket)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(42));
     assert!(!delegated.join(imageless::GC_ROOT_NAME).exists());
     assert!(!delegated.join(imageless::GC_ROOTS_DIR_NAME).exists());
+    // The engine's config is back, byte for byte, so a create retried on the
+    // same bundle plans against the image, not against our rewrite.
+    assert_eq!(std::fs::read(&config).unwrap(), engine_config);
+    let succeeding_delegate = dir.join("delegate-ok");
+    executable(&succeeding_delegate, "exit 0");
+    let retried = runc(&delegated, &succeeding_delegate, &resolver.socket)
+        .output()
+        .unwrap();
+    assert_success(&retried);
+    assert_eq!(root_path(&config), STORE_PATH);
 
     let rewrite = dir.join("rewrite");
     std::fs::create_dir(&rewrite).unwrap();

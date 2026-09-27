@@ -56,7 +56,13 @@ pub(crate) fn validate_realise_output(
 }
 
 pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Result<String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Under `runc create` our stdin is the container's stdio: a Nix client,
+    // fetcher, or credential prompt must never read bytes meant for the
+    // workload, nor hold its pipe open after we return.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
