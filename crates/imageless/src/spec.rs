@@ -25,6 +25,15 @@ pub fn plan(
         return Ok(None);
     }
     let release = annotations.get(RELEASE_ANNOTATION);
+    // Contradictory before it is selective: the two families are mutually
+    // exclusive for the pod as a whole (SPEC §4.2), so a container the
+    // selectors happen to skip must not pass the pod through silently.
+    if release.is_some() && annotations.contains_key(SOURCE_ANNOTATION) {
+        return Err(ContractError::new(
+            RELEASE_ANNOTATION,
+            "must not be combined with development source annotations",
+        ));
+    }
     let (containers_field, skip_field) = if release.is_some() {
         (
             RELEASE_CONTAINERS_ANNOTATION,
@@ -39,12 +48,6 @@ pub fn plan(
     if let Some(reference) = release {
         let reference = ReleaseReference::parse(reference)
             .map_err(|error| ContractError::new(RELEASE_ANNOTATION, error.diagnostic))?;
-        if annotations.contains_key(SOURCE_ANNOTATION) {
-            return Err(ContractError::new(
-                RELEASE_ANNOTATION,
-                "must not be combined with development source annotations",
-            ));
-        }
         return Ok(Some(Materialize::Release(reference)));
     }
     let Some(source) = annotations.get(SOURCE_ANNOTATION) else {
@@ -332,8 +335,23 @@ pub fn expansion_request(
     };
     if !annotations.contains_key(RELEASE_ANNOTATION) && !annotations.contains_key(SOURCE_ANNOTATION)
     {
-        if let Some(embedded) = embedded_source_annotations(&rootfs)? {
-            annotations.extend(embedded);
+        match embedded_source_annotations(&rootfs) {
+            Ok(Some(embedded)) => annotations.extend(embedded),
+            Ok(None) => {}
+            // A flake.nix that is not a regular file fails only a container
+            // that would have been materialized from it. The pod sandbox and
+            // containers the selectors skip carry the same image layers (or
+            // none of them) and are passed through, as for any image.
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let mut selected = annotations.clone();
+                selected.insert(SOURCE_ANNOTATION.to_string(), "/etc/imageless".to_string());
+                return match plan(&selected, &rootfs, default_output) {
+                    Ok(None) => Ok(None),
+                    Ok(Some(_)) => Err(error),
+                    Err(contract) => Err(io::Error::new(io::ErrorKind::InvalidInput, contract)),
+                };
+            }
+            Err(error) => return Err(error),
         }
     }
     let materialize = plan(&annotations, &rootfs, default_output)
@@ -575,6 +593,60 @@ mod tests {
         std::os::unix::fs::symlink("../elsewhere/flake.nix", &flake).unwrap();
         assert!(expansion_request(&bundle.join("config.json"), &bundle, "rootfs", 30).is_err());
         std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn a_broken_embedded_flake_fails_only_the_containers_it_would_build() {
+        let bundle = temporary("broken-embedded");
+        let rootfs = bundle.join("rootfs");
+        let flake = rootfs.join(EMBEDDED_FLAKE_PATH);
+        std::fs::create_dir_all(flake.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../elsewhere/flake.nix", &flake).unwrap();
+        let config = bundle.join("config.json");
+        let with_annotations = |annotations: serde_json::Value| {
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "root": { "path": "rootfs" },
+                    "annotations": annotations,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            expansion_request(&config, &bundle, "rootfs", 30)
+        };
+        // Selected (no selectors at all): fails closed, as before.
+        assert!(with_annotations(serde_json::json!({})).is_err());
+        // The pod sandbox and a skipped sidecar pass through untouched.
+        assert!(with_annotations(serde_json::json!({
+            (CRI_CONTAINER_TYPE_ANNOTATION): "sandbox"
+        }))
+        .unwrap()
+        .is_none());
+        assert!(with_annotations(serde_json::json!({
+            (CRI_CONTAINER_NAME_ANNOTATION): "sidecar",
+            (SKIP_CONTAINERS_ANNOTATION): "sidecar",
+        }))
+        .unwrap()
+        .is_none());
+        // A container the selectors do pick still fails.
+        assert!(with_annotations(serde_json::json!({
+            (CRI_CONTAINER_NAME_ANNOTATION): "app",
+            (CONTAINERS_ANNOTATION): "app",
+        }))
+        .is_err());
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn release_and_source_together_fail_even_where_selectors_skip() {
+        let skipped = annotations(&[
+            (RELEASE_ANNOTATION, RELEASE_REF),
+            (SOURCE_ANNOTATION, "/etc/imageless"),
+            (CRI_CONTAINER_NAME_ANNOTATION, "sidecar"),
+            (RELEASE_CONTAINERS_ANNOTATION, "app"),
+        ]);
+        assert!(plan(&skipped, Path::new("/b/rootfs"), "rootfs").is_err());
     }
 
     #[test]

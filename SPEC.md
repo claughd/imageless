@@ -44,6 +44,11 @@ container is selected with:
 - source: `/etc/imageless`
 - output: `rootfs`
 
+A `flake.nix` that exists there but is not a regular file (a symlink, a
+directory) fails the create of any container that would have been selected. The
+pod sandbox and containers the selectors skip pass through, as they would for
+any image.
+
 The installable is the canonical equivalent of
 `path:<bundle-rootfs>/etc/imageless#rootfs`. The flake output must evaluate to
 a derivation whose single output path is a usable root filesystem.
