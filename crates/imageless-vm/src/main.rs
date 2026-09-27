@@ -377,7 +377,10 @@ fn qemu_command(vm: &PreparedVm, options: &Options) -> Command {
     let kvm = Path::new("/dev/kvm").exists();
     let mut command = Command::new(tool("IMAGELESS_VM_QEMU", "qemu-system-x86_64"));
     command
-        .args(["-M", "microvm,isa-serial=on,rtc=on"])
+        // No ACPI, like a Firecracker guest: QEMU then announces the
+        // virtio-mmio devices on the kernel command line, which is the only
+        // way this kernel finds them.
+        .args(["-M", "microvm,acpi=off,isa-serial=on,rtc=on"])
         .args(["-accel", if kvm { "kvm" } else { "tcg" }])
         .args(["-cpu", if kvm { "host" } else { "max" }])
         .args(["-m", &options.memory.to_string()])

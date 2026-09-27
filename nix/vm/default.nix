@@ -69,6 +69,16 @@ let
     grep -q 'workload exited with status 0' console.log
     # The image is cached by (root, init, format): one image, reused.
     test $(ls state/images/*.erofs | wc -l) = 1
+
+    # Firecracker needs KVM to boot, and the sandbox has none; but it parses
+    # and validates the whole config before it opens /dev/kvm. So a config
+    # it would reject fails here, and one it accepts fails only at KVM.
+    config=$(imageless-vm prepare store:${smokeRoot} --state $PWD/state \
+      --closure-file $closure/store-paths -- /bin/smoke)
+    ${pkgs.firecracker}/bin/firecracker --no-api --config-file "$config" > firecracker.log 2>&1 || true
+    cat firecracker.log
+    grep -q 'Error creating KVM object' firecracker.log
+    ! grep -q 'ParseFromJson' firecracker.log
     touch $out
   '';
 in

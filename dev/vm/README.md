@@ -64,11 +64,14 @@ Images and VM files go under `--state` (default `/var/lib/imageless-vm`).
   - argv, env and cwd arrived from the config drive.
 
   The check then confirms that one cached image was built.
-- **Not yet run:** Firecracker itself. The development environment this was
-  written in has no `/dev/kvm`. QEMU `microvm` uses the same device model
-  (virtio-mmio, announced on the kernel command line) and the same kernel and
-  image, so the remaining risk is in the Firecracker config. The first
-  `imageless-vm run` on a KVM host will show it.
+- **Verified without KVM:** Firecracker 1.15.1 parses and validates the
+  generated config, and fails only at creating its KVM object. The same smoke
+  check asserts this, so a config Firecracker rejects fails `flake check`.
+- **Not yet run:** a Firecracker boot. The environment this was written in has
+  no `/dev/kvm`. QEMU `microvm` with `acpi=off` uses the same device model
+  (virtio-mmio devices announced on the kernel command line), kernel, image
+  and config drive. The first `imageless-vm run` on a KVM host will settle
+  it.
 - **Not built yet:**
   - guest networking (tap devices, addresses);
   - vsock control;
