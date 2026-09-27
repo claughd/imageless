@@ -139,7 +139,9 @@ materializes the root read-only, so `--writable PATH` (repeatable) gives the
 pod an emptyDir at each path the workload writes, such as `/tmp`. Credentials come
 from `docker login` (config.json `auths` and credential helpers; Basic and
 Bearer auth). Loopback registries like kind's `localhost:5001` are plain HTTP
-automatically; everything else is HTTPS unless you pass `--plain-http`. Some
+automatically; everything else is HTTPS unless you pass `--plain-http`, which
+also consents to sending that registry's credentials in cleartext (with a
+warning), to that host and no other. Some
 registries garbage-collect untagged manifests (GHCR, ECR lifecycle policies) —
 `--tag` adds a tag to protect the push while the pod reference stays
 digest-pinned.

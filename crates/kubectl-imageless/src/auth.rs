@@ -407,6 +407,39 @@ fn auth_parameters(parameters: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// Whether credentials may go to `realm`. The realm is registry-supplied: an
+/// http endpoint would carry the password in cleartext and hand back a
+/// push-capable token. So: https always; a loopback realm (the dev-registry
+/// case); and plain http only to the host the user already consented to talk
+/// cleartext with through --plain-http (`cleartext_host`) — the same consent
+/// the Basic scheme runs on — never to a host the registry names instead.
+pub(crate) fn realm_permitted(
+    realm: &str,
+    host: &str,
+    cleartext_host: Option<&str>,
+) -> Result<(), String> {
+    let realm_host = realm
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+        .unwrap_or_default();
+    let consented = realm
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        && cleartext_host.is_some_and(|consented| consented.eq_ignore_ascii_case(realm_host));
+    if realm.starts_with("https://") || crate::registry::is_loopback(realm_host) || consented {
+        return Ok(());
+    }
+    Err(format!(
+        "registry `{host}` pointed authentication at `{realm}`, which is not https — \
+         refusing to send credentials in cleartext{}",
+        if cleartext_host.is_some() {
+            " (--plain-http consents to cleartext with the registry's own host only)"
+        } else {
+            ""
+        }
+    ))
+}
+
 /// GET the token endpoint named by the challenge. The challenge's scope is
 /// used verbatim when present — the registry knows what it wants; otherwise
 /// ask for push on the one repository being pushed.
@@ -417,6 +450,7 @@ pub fn fetch_bearer_token(
     credential: &Credential,
     source: &CredentialSource,
     host: &str,
+    cleartext_host: Option<&str>,
 ) -> Result<String, String> {
     let Challenge::Bearer {
         realm,
@@ -426,19 +460,7 @@ pub fn fetch_bearer_token(
     else {
         return Err("a Basic challenge has no token endpoint".to_string());
     };
-    // The realm is registry-supplied: an http endpoint would carry the
-    // password in cleartext and hand back a push-capable token, so only
-    // https — or a loopback realm, which is the dev-registry case — is used.
-    let realm_host = realm
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
-        .unwrap_or_default();
-    if !realm.starts_with("https://") && !crate::registry::is_loopback(realm_host) {
-        return Err(format!(
-            "registry `{host}` pointed authentication at `{realm}`, which is not https — \
-             refusing to send credentials in cleartext"
-        ));
-    }
+    realm_permitted(realm, host, cleartext_host)?;
     let scope = scope
         .clone()
         .unwrap_or_else(|| format!("repository:{name}:pull,push"));
@@ -605,9 +627,39 @@ mod tests {
             },
             &CredentialSource::ConfigAuths,
             "registry.example",
+            None,
         )
         .unwrap_err();
         assert!(error.contains("not https"), "{error}");
+    }
+
+    #[test]
+    fn plain_http_consents_to_cleartext_with_the_registry_host_only() {
+        // --plain-http to `harbor.lan:8080` consents to that host, whichever
+        // scheme spelling the registry's realm uses.
+        let consent = Some("harbor.lan:8080");
+        assert!(realm_permitted(
+            "http://harbor.lan:8080/service/token",
+            "harbor.lan:8080",
+            consent
+        )
+        .is_ok());
+        assert!(
+            realm_permitted("HTTP://HARBOR.LAN:8080/token", "harbor.lan:8080", consent).is_ok()
+        );
+        // Never to a host the registry names instead, nor a different port.
+        for realm in [
+            "http://evil.example/token",
+            "http://harbor.lan:9090/token",
+            "http://harbor.lan.evil/token",
+        ] {
+            let error = realm_permitted(realm, "harbor.lan:8080", consent).unwrap_err();
+            assert!(error.contains("own host only"), "{error}");
+        }
+        // Without --plain-http, only https and loopback realms.
+        assert!(realm_permitted("http://harbor.lan:8080/token", "harbor.lan:8080", None).is_err());
+        assert!(realm_permitted("https://auth.example/token", "harbor.lan:8080", None).is_ok());
+        assert!(realm_permitted("http://127.0.0.1:5000/token", "127.0.0.1:5000", None).is_ok());
     }
 
     #[test]

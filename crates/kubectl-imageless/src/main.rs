@@ -149,7 +149,8 @@ const USAGE: &str =
      \x20                       but some registries (GHCR, ECR) garbage-collect untagged\n\
      \x20                       manifests\n\
      \x20 --plain-http          push over http:// to a non-loopback registry (localhost,\n\
-     \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically)\n\
+     \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically);\n\
+     \x20                       its credentials then cross in cleartext, to it alone\n\
      \x20 --dry-run             print digests and the pod manifest; no network\n\
      \x20 --writable PATH       mount an emptyDir at PATH (repeatable) — the materialized\n\
      \x20                       root is read-only, so this is where a workload writes\n\
