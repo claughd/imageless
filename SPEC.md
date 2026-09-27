@@ -201,8 +201,10 @@ A conforming runtime, at per-container `create`:
    ambiguous output is an error.
 4. **Rewrites atomically.** `root.path` in `config.json` is replaced via
    write-to-temp + rename, preserving file mode and fsyncing the file and its
-   parent directory. Unrelated OCI fields are preserved byte-for-byte where not
-   rewritten. `root.readonly` is forced to `true`: the new root is a store path
+   parent directory. The document is re-serialized: every field the runtime
+   does not rewrite keeps its value, but formatting and key order are not
+   preserved. The file's consumers parse it; none compare its bytes.
+   `root.readonly` is forced to `true`: the new root is a store path
    shared with every other container and the node itself, so a workload that
    needs writable paths gets them from mounts (`tmpfs`, volumes), never from
    the root. Process metadata is only applied when the release manifest
