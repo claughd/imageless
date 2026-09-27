@@ -27,6 +27,10 @@ pub struct Registry {
     credential_source: CredentialSource,
     /// Full `Authorization` header value once a challenge has been answered.
     authorization: Option<String>,
+    /// Plain HTTP to a host that is not loopback: the user's --plain-http is
+    /// consent to send this host credentials in cleartext, and to nobody else.
+    cleartext: bool,
+    warned_cleartext: bool,
 }
 
 /// Generous because a blob PUT is one request: the whole seed uploads inside
@@ -61,6 +65,8 @@ impl Registry {
             credential,
             credential_source,
             authorization: None,
+            cleartext: scheme == "http" && !is_loopback(host),
+            warned_cleartext: false,
         };
         // The /v2/ ping proves the API exists and surfaces the auth challenge
         // before any upload starts.
@@ -252,6 +258,19 @@ impl Registry {
         }
     }
 
+    /// Said once per push: the credential is about to cross the wire in
+    /// cleartext, with the user's --plain-http as the only consent.
+    fn warn_cleartext(&mut self) {
+        if !self.warned_cleartext {
+            self.warned_cleartext = true;
+            eprintln!(
+                "warning: sending the credentials for `{}` over plain HTTP (--plain-http); \
+                 anyone on the network path can read them",
+                self.host
+            );
+        }
+    }
+
     /// Answers the challenge; `false` means no header was gained, so the
     /// caller must not retry.
     fn authenticate(
@@ -266,13 +285,17 @@ impl Registry {
             return Ok(false);
         };
         match auth::parse_www_authenticate(header)? {
-            Challenge::Basic => match &self.credential {
-                Credential::Basic { username, secret } => {
-                    self.authorization = Some(auth::basic_header(username, secret));
-                    Ok(true)
+            Challenge::Basic => {
+                let Credential::Basic { username, secret } = &self.credential else {
+                    return Ok(false);
+                };
+                let header = auth::basic_header(username, secret);
+                if self.cleartext {
+                    self.warn_cleartext();
                 }
-                Credential::Anonymous => Ok(false),
-            },
+                self.authorization = Some(header);
+                Ok(true)
+            }
             challenge @ Challenge::Bearer { .. } => {
                 let token = auth::fetch_bearer_token(
                     &self.agent,
@@ -281,7 +304,11 @@ impl Registry {
                     &self.credential,
                     &self.credential_source,
                     &self.host,
+                    self.cleartext.then_some(self.host.as_str()),
                 )?;
+                if self.cleartext && matches!(self.credential, Credential::Basic { .. }) {
+                    self.warn_cleartext();
+                }
                 self.authorization = Some(format!("Bearer {token}"));
                 Ok(true)
             }
