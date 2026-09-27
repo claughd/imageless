@@ -1,0 +1,23 @@
+# containerd drop-in: the imageless runtime handler for a k3s node.
+#
+# k3s regenerates config.toml on every start, but the config it writes (k3s
+# releases on containerd 2.x) imports config-v3.toml.d/*.toml, and containerd
+# merges imported plugin tables into its own. A drop-in there survives every
+# restart and needs no template, so it is independent of the base config k3s
+# renders. setup.sh installs it; verified on k3s v1.35.5+k3s1 / containerd
+# 2.2.3 with `k3s crictl info`, the only place the merge is observable.
+#
+# The body mirrors examples/containerd-config.toml's 2.x table.
+version = 3
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless]
+  runtime_type = "io.containerd.runc.v2"
+  pod_annotations = ["imageless.run/*"]
+  container_annotations = ["imageless.run/*"]
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.imageless.options]
+    BinaryName = "/usr/local/bin/imageless-runc"
+    # Tracks the node's cgroup driver: k3s without systemd-managed cgroups
+    # resolves its own runc handler to cgroupfs. Set true on a node where
+    # kubelet uses the systemd driver, or every pod on this handler fails at
+    # FailedCreatePodSandBox with no imageless diagnostic at all.
+    SystemdCgroup = false
