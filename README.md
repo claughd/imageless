@@ -251,6 +251,22 @@ and put the second line of `issuer.pub` in the issuer's node policy:
 }
 ```
 
+A catalog built with `nix/release-catalog.nix` lives in the Nix store, where
+a signing key must never be. Sign it on the way out instead, with the key read
+from wherever your secrets live:
+
+```bash
+nix run .#imageless-sign-release -- --secret-key /run/secrets/release.key \
+  --public-key issuer.pub "$(nix build .#my-release --print-out-paths)" ./publish
+```
+
+It copies the catalog into `./publish` (which may already hold earlier
+releases), refuses any manifest whose bytes do not match its digest name,
+signs each unsigned manifest, and with `--public-key` verifies every
+signature. It refuses a secret key that resolves into `/nix/store`.
+`--resign` replaces existing signatures when rotating keys. Upload
+`./publish` as the catalog.
+
 An issuer without keys must say `"allow_unsigned": true`, which lets anyone
 who can write its catalog choose what runs. List two keys while rotating, and
 add a digest to `revoked_manifests` to withdraw a release that was validly

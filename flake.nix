@@ -345,18 +345,21 @@
           # smoke trusts it; a real signing key never enters the Nix store.
           smoke-release-public-key = builtins.elemAt
             (lib.splitString "\n" (builtins.readFile ./nix/test-keys/release-smoke.pub)) 1;
+          imageless-sign-release = pkgs.callPackage ./nix/sign-release.nix { };
+          # Signed with the same tool a publisher runs, so this check exercises
+          # it end to end: copy out of the store, check digests, sign, verify.
           smoke-release = pkgs.runCommand "imageless-release-imageless-smoke-signed"
             {
-              nativeBuildInputs = [ pkgs.minisign ];
+              nativeBuildInputs = [ imageless-sign-release ];
               inherit (smoke-release-unsigned) passthru;
             }
             ''
-              cp -r ${smoke-release-unsigned} $out
-              chmod -R u+w $out
-              manifest=$out/sha256/${smoke-release-unsigned.digest}.json
-              minisign -S -s ${./nix/test-keys/release-smoke.key} -m "$manifest" \
-                -t "imageless-smoke/cri"
-              minisign -V -p ${./nix/test-keys/release-smoke.pub} -m "$manifest"
+              imageless-sign-release --insecure-key-in-store \
+                --secret-key ${./nix/test-keys/release-smoke.key} \
+                --public-key ${./nix/test-keys/release-smoke.pub} \
+                --trusted-comment "imageless-smoke/cri" \
+                ${smoke-release-unsigned} $out
+              test -s $out/sha256/${smoke-release-unsigned.digest}.json.minisig
             '';
           # Parameterized over containerd so the in-guest ctr client always
           # matches the node's daemon generation (a 2.x ctr against a 1.x
@@ -666,6 +669,7 @@
           inherit docker-embedded-scenario docker-embedded-isolated;
           inherit docker-embedded-smoke imageless-cri-vm imageless-cri-vm-containerd1;
           inherit smoke-image smoke-rootfs smoke-release imageless-cri-smoke;
+          inherit imageless-sign-release;
           inherit cri-embedded-seed cri-embedded-image;
           inherit stock-oci-smoke;
           default = imageless-runc;

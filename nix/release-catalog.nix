@@ -4,6 +4,11 @@
 # architecture. Each target closure is built and pushed to its named cache by
 # whatever release pipeline the issuer runs — any CI that can copy a closure
 # and emit this JSON conforms.
+#
+# The catalog this builds is unsigned, because it lives in the store and a
+# signing key never may. Nodes require signatures by default (SPEC.md §6.1),
+# so sign the built catalog outside the store with nix/sign-release.nix
+# (`nix run .#imageless-sign-release`).
 { lib
 , runCommand
 , writeText
