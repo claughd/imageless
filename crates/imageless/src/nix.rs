@@ -3,9 +3,11 @@
 use crate::spec::validate_store_path;
 use crate::MAX_CAPTURE_BYTES;
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -105,14 +107,16 @@ pub(crate) fn run_command_confined(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("materializer stderr was not captured"))?;
-    let stdout_reader = thread::spawn(move || capture_output(stdout, Retention::Head));
-    let stderr_reader = thread::spawn(move || capture_output(stderr, Retention::Tail));
+    // Each reader reports on `finished` when its pipe closes, so the wait for
+    // them below wakes on the event rather than on a polling tick.
+    let (finished_tx, finished) = mpsc::channel();
+    let stdout_reader = spawn_reader(stdout, Retention::Head, finished_tx.clone());
+    let stderr_reader = spawn_reader(stderr, Retention::Tail, finished_tx);
     let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
+    let deadline = started + timeout;
+    let status = match wait_for_exit(&mut child, deadline)? {
+        Some(status) => status,
+        None => {
             kill_process_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
@@ -130,28 +134,34 @@ pub(crate) fn run_command_confined(
                 timed_out("Nix operation timed out", &excerpt),
             ));
         }
-        thread::sleep(Duration::from_millis(10));
     };
     // A helper can outlive the top-level Nix process while retaining an
     // inherited stdout/stderr fd. Keep pipe draining inside the same deadline;
-    // otherwise joining the readers could wait forever after `try_wait` reports
-    // the parent exited.
-    while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
-        if started.elapsed() >= timeout {
-            kill_process_group(child.id());
-            drop(stdout_reader);
-            let excerpt = join_capture_within(stderr_reader, KILL_GRACE)
-                .map(|stderr| diagnostic_excerpt(&stderr.bytes))
-                .unwrap_or_default();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                timed_out(
-                    "Nix operation output did not close before the deadline",
-                    &excerpt,
-                ),
-            ));
+    // otherwise joining the readers could wait forever after the parent
+    // exited.
+    let mut open = 2;
+    while open > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match finished.recv_timeout(remaining) {
+            Ok(()) => open -= 1,
+            // Both senders are gone: a reader panicked, which the join
+            // below reports.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                kill_process_group(child.id());
+                drop(stdout_reader);
+                let excerpt = join_capture_within(stderr_reader, KILL_GRACE)
+                    .map(|stderr| diagnostic_excerpt(&stderr.bytes))
+                    .unwrap_or_default();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    timed_out(
+                        "Nix operation output did not close before the deadline",
+                        &excerpt,
+                    ),
+                ));
+            }
         }
-        thread::sleep(Duration::from_millis(10));
     }
     let stdout = join_capture(stdout_reader)?;
     let stderr = join_capture(stderr_reader)?;
@@ -170,6 +180,60 @@ pub(crate) fn run_command_confined(
         }));
     }
     Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
+}
+
+fn spawn_reader(
+    pipe: impl Read + Send + 'static,
+    retention: Retention,
+    finished: mpsc::Sender<()>,
+) -> thread::JoinHandle<io::Result<CapturedOutput>> {
+    thread::spawn(move || {
+        let captured = capture_output(pipe, retention);
+        let _ = finished.send(());
+        captured
+    })
+}
+
+/// Waits for `child` to exit, until `deadline`; `None` when it has not.
+///
+/// Wakes when the child exits, not on the next tick of a poll: every Nix
+/// spawn on the warm path used to pay up to 10 ms here, on a GC-root
+/// registration that itself takes about 30. A pidfd makes the exit pollable;
+/// a kernel without one (before 5.3) gets a short backoff instead.
+fn wait_for_exit(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor,
+    // which OwnedFd then owns. The pid is our unreaped child, so it cannot
+    // have been reused.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+    let pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) });
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match &pidfd {
+            Some(pidfd) => {
+                let mut poll = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Round up, so a sub-millisecond remainder still waits.
+                let milliseconds = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128);
+                // SAFETY: one valid pollfd for the duration of the call. EINTR
+                // and a timeout both loop back to try_wait and the deadline.
+                unsafe { libc::poll(&mut poll, 1, milliseconds as libc::c_int) };
+            }
+            None => {
+                thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 fn timed_out(reason: &str, excerpt: &str) -> String {
@@ -281,11 +345,13 @@ fn join_capture_within(
     grace: Duration,
 ) -> Option<CapturedOutput> {
     let started = Instant::now();
+    let mut backoff = Duration::from_millis(1);
     while !handle.is_finished() {
         if started.elapsed() >= grace {
             return None;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(10));
     }
     join_capture(handle).ok()
 }
@@ -310,6 +376,59 @@ pub(crate) fn kill_process_group(pid: u32) {
 mod tests {
     use super::*;
     use crate::testutil::STORE;
+
+    /// The runner wakes when the child exits and its pipes close, not on a
+    /// polling tick. The old 10 ms loop could not return a short command in
+    /// less than one tick, because the first `try_wait` always found it still
+    /// running; the fastest of several runs is the robust way to see that.
+    #[test]
+    fn a_fast_command_returns_without_waiting_for_a_tick() {
+        let fastest = (0..20)
+            .map(|_| {
+                let started = Instant::now();
+                run_command(&mut Command::new("true"), Duration::from_secs(10)).unwrap();
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            fastest < Duration::from_millis(8),
+            "fastest run took {fastest:?}"
+        );
+    }
+
+    /// `IMAGELESS_BENCH_STORE_PATH=/nix/store/… cargo test -p imageless --lib
+    /// root_registration_cost -- --ignored --nocapture`: the warm path's GC-root
+    /// registration through the runner, fastest and median of 20.
+    #[test]
+    #[ignore]
+    fn root_registration_cost() {
+        let Ok(store_path) = std::env::var("IMAGELESS_BENCH_STORE_PATH") else {
+            return;
+        };
+        let roots = std::env::temp_dir().join(format!("il-root-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&roots).unwrap();
+        let mut samples: Vec<Duration> = (0..20)
+            .map(|index| {
+                let started = Instant::now();
+                run_command(
+                    Command::new("nix-store")
+                        .args(["--realise", &store_path, "--add-root"])
+                        .arg(roots.join(format!("root-{index}")))
+                        .args(["--option", "require-sigs", "true"]),
+                    Duration::from_secs(30),
+                )
+                .unwrap();
+                started.elapsed()
+            })
+            .collect();
+        samples.sort();
+        eprintln!(
+            "root registration: fastest {:?}, median {:?}",
+            samples[0], samples[10]
+        );
+        std::fs::remove_dir_all(roots).unwrap();
+    }
 
     #[test]
     fn a_timed_out_command_reports_what_nix_last_wrote() {
