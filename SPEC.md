@@ -79,6 +79,13 @@ regular files and directories only (symlinks are rejected). The staged copy is
 what the materializer evaluates; the container never controls paths outside its
 own rootfs.
 
+The rejection covers the path *to* the source as well as the tree under it. The
+runtime reads the rootfs from the host, where an image symlink such as
+`/a -> /` resolves against the node's root, so a source whose in-image path
+passes through any symlink fails the create. Zero-config discovery (§2.1) does
+not fail on a symlinked `etc` or `etc/imageless`; the image simply carries no
+embedded flake there and passes through.
+
 ## 3. Annotations (highest precedence)
 
 OCI annotations override the zero-config default. Annotation values are
