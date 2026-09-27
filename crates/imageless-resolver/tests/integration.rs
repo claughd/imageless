@@ -357,7 +357,9 @@ fn development_source_uses_the_sanitized_unprivileged_worker() {
         &nix,
         &format!(
             r#"
-if [ -z "$root" ]; then
+# The evaluation is the `build` call; root registration is `--realise`.
+# Both name a root now: the build holds an --out-link while it runs.
+case " $* " in *" build "*)
   test -z "${{LEAK_SECRET+x}}"
   while read -r key real effective saved filesystem; do
     if [ "$key" = "Uid:" ]; then
@@ -367,7 +369,8 @@ if [ -z "$root" ]; then
   done < /proc/self/status
   printf '%s\n' "{}"
   exit 0
-fi
+  ;;
+esac
 "#,
             worker_uid.display(),
             STORE_PATH

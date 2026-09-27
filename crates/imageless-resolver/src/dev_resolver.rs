@@ -27,7 +27,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: imageless-dev-resolver --user USER --nix ABSOLUTE_PATH \
          --cpu-seconds 1..3600 [--cache-home ABSOLUTE_PATH] [--confine-root ABSOLUTE_PATH] \
-         [--locked] --installable FLAKE#OUTPUT"
+         [--locked] [--out-link ABSOLUTE_PATH] --installable FLAKE#OUTPUT"
     );
     std::process::exit(2);
 }
@@ -44,6 +44,7 @@ fn main() {
     let mut installable = None;
     let mut confine_root: Option<PathBuf> = None;
     let mut locked = false;
+    let mut out_link: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -56,6 +57,7 @@ fn main() {
             "--installable" => installable = Some(value(&mut args)),
             "--confine-root" => confine_root = Some(PathBuf::from(value(&mut args))),
             "--locked" => locked = true,
+            "--out-link" => out_link = Some(PathBuf::from(value(&mut args))),
             "--help" | "-h" => usage(),
             _ => usage(),
         }
@@ -71,7 +73,7 @@ fn main() {
     if !nix.is_absolute() || user.is_empty() || user.as_bytes().contains(&0) {
         usage();
     }
-    if [&cache_home, &confine_root]
+    if [&cache_home, &confine_root, &out_link]
         .into_iter()
         .flatten()
         .any(|path| !path.is_absolute())
@@ -118,9 +120,14 @@ fn main() {
             "--extra-experimental-features",
             "nix-command flakes",
             "build",
-            "--no-link",
             "--print-out-paths",
         ])
+        // With --out-link the build registers an indirect GC root the moment
+        // it finishes, closing the window before the resolver's own root.
+        .args(match &out_link {
+            Some(link) => vec![std::ffi::OsString::from("--out-link"), link.into()],
+            None => vec![std::ffi::OsString::from("--no-link")],
+        })
         .args(locked.then_some("--no-update-lock-file"))
         .arg(installable)
         .env_clear()

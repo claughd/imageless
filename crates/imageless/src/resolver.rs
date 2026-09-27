@@ -729,10 +729,13 @@ impl Resolver {
         };
         let timeout = remaining(deadline, "before development source evaluation")?;
         let timeout_seconds = timeout.as_secs().max(1).to_string();
-        // Guard slot, not dead code: the worker's cache directory must survive
-        // until `run_command` returns, and the command is built inside the
-        // block below.
+        // Guard slots, not dead code: the worker's cache directory and the
+        // in-process pending-root directory hold the build's indirect GC root,
+        // so they must survive until the bundle's own root is registered below
+        // — the end of this function — and the command is built inside the
+        // block that follows.
         let mut _worker_cache = None;
+        let mut _pending_root = None;
         let stdout = {
             let _permit =
                 self.acquire_permit(deadline, "while waiting for a development Nix operation")?;
@@ -751,6 +754,11 @@ impl Resolver {
                         .arg(&cache.directory)
                         .arg("--installable")
                         .arg(evaluation_installable)
+                        // The worker's own scratch, which it can write and which
+                        // is bound into its confinement: the build holds an
+                        // indirect GC root there until ours is registered.
+                        .arg("--out-link")
+                        .arg(cache.directory.join("pending-root"))
                         .env_clear();
                     if let Some(root) = &confinement_root {
                         command.arg("--confine-root").arg(&root.directory);
@@ -763,14 +771,22 @@ impl Resolver {
                 }
                 None => {
                     let nix = resolve_program(&self.inner.config.nix)?;
+                    let pending = PendingRootDirectory {
+                        directory: create_private_directory("pending-root", "a pending GC root")?,
+                    };
+                    let pending_link = pending.directory.join("result");
+                    let pending_directory = pending.directory.clone();
+                    _pending_root = Some(pending);
                     let mut command = Command::new(&nix);
-                    command.args([
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        "build",
-                        "--no-link",
-                        "--print-out-paths",
-                    ]);
+                    command
+                        .args([
+                            "--extra-experimental-features",
+                            "nix-command flakes",
+                            "build",
+                            "--print-out-paths",
+                            "--out-link",
+                        ])
+                        .arg(&pending_link);
                     if locked {
                         command.arg("--no-update-lock-file");
                     }
@@ -781,10 +797,15 @@ impl Resolver {
                             .filter_map(std::env::var_os)
                             .map(PathBuf::from)
                             .collect();
+                        let writable: Vec<PathBuf> = staged_directory
+                            .iter()
+                            .cloned()
+                            .chain([pending_directory])
+                            .collect();
                         let confinement = Confinement::for_evaluation(
                             &root.directory,
                             &nix,
-                            staged_directory.as_slice(),
+                            &writable,
                             &certificates,
                         )
                         .map_err(|error| {
@@ -1443,37 +1464,55 @@ impl Drop for ConfinementRoot {
 }
 
 fn create_confinement_root() -> Result<ConfinementRoot, ResolutionError> {
+    create_private_directory("confine", "evaluation confinement")
+        .map(|directory| ConfinementRoot { directory })
+}
+
+/// Where an in-process evaluation's `nix build --out-link` lands. The link is
+/// an indirect GC root from the moment the build finishes, so the output
+/// cannot be collected in the window before the bundle's own root exists; the
+/// directory (and the then-redundant link) goes when the evaluation is over.
+struct PendingRootDirectory {
+    directory: PathBuf,
+}
+
+impl Drop for PendingRootDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// A fresh 0700 directory under the temp dir, named for `label`.
+fn create_private_directory(label: &str, purpose: &str) -> Result<PathBuf, ResolutionError> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let failed = |error: io::Error| {
+        ResolutionError::new(
+            ErrorCategory::Internal,
+            format!("could not prepare {purpose}: {error}"),
+            true,
+        )
+    };
     for _ in 0..128 {
         let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!(".imageless-confine-{}-{nonce}", std::process::id()));
+            std::env::temp_dir().join(format!(".imageless-{label}-{}-{nonce}", std::process::id()));
         match std::fs::create_dir(&path) {
             Ok(()) => {
-                let guard = ConfinementRoot { directory: path };
-                std::fs::set_permissions(&guard.directory, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|error| {
-                        ResolutionError::new(
-                            ErrorCategory::Internal,
-                            format!("could not prepare evaluation confinement: {error}"),
-                            true,
-                        )
-                    })?;
-                return Ok(guard);
+                if let Err(error) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(failed(error));
+                }
+                return Ok(path);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(ResolutionError::new(
-                    ErrorCategory::Internal,
-                    format!("could not prepare evaluation confinement: {error}"),
-                    true,
-                ))
-            }
+            Err(error) => return Err(failed(error)),
         }
     }
     Err(ResolutionError::new(
         ErrorCategory::Internal,
-        "evaluation confinement namespace exhausted",
+        format!("{purpose} namespace exhausted"),
         true,
     ))
 }
@@ -2615,6 +2654,9 @@ rmdir "{state}/lock"
         assert!(arguments.contains(".imageless-source-"));
         // A staged in-image flake evaluates against the lock it ships.
         assert!(arguments.contains("--no-update-lock-file"));
+        // The build holds an indirect GC root until the bundle's exists.
+        assert!(arguments.contains("--out-link"));
+        assert!(!arguments.contains("--no-link"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
