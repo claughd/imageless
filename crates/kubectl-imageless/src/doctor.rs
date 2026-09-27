@@ -650,12 +650,23 @@ fn check_registry(repo: &str, plain_http: bool) -> Check {
     match registry::Registry::connect(repo, plain_http) {
         Ok(_) => {
             let host = repo.split('/').next().unwrap_or(repo);
+            // Reaching /v2/ proves reachability and, at most, read access: a
+            // Bearer registry hands an anonymous client a pull token without
+            // ever seeing a credential. Say which one was presented, and leave
+            // push permission to the push that proves it.
+            let credentials = match crate::auth::lookup(host) {
+                Ok((_, source)) => source.describe(),
+                Err(_) => "no usable stored credentials".to_string(),
+            };
             let mut check = Check::new(
                 "registry",
                 Status::Pass,
-                format!("`{host}` answered /v2/ and accepted our credentials"),
-            );
-            if registry::is_loopback(host.split(':').next().unwrap_or(host)) {
+                format!("`{host}` answered /v2/ ({credentials})"),
+            )
+            .detail("push permission is not checked here; the first push proves it");
+            // `is_loopback` splits the port itself, bracketed IPv6 included;
+            // cutting at the first `:` here turned `[::1]:5000` into `[`.
+            if registry::is_loopback(host) {
                 check.status = Status::Warn;
                 check = check.remedy(
                     "the seed is pulled by the node, not by this client: a loopback host means \

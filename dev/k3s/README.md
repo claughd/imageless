@@ -113,16 +113,14 @@ does the `distribution` package from nixpkgs.
 cp -r examples/nginx-embedded /tmp/app && chmod -R u+w /tmp/app
 sed -i 's/imageless-nginx-ok/hello from k3s/' /tmp/app/flake.nix
 "$(nix build .#kubectl-imageless --no-link --print-out-paths)/bin/kubectl-imageless" \
-  run /tmp/app --name hello --repo 127.0.0.1:5000/team/hello \
+  run /tmp/app --name hello --repo 127.0.0.1:5000/team/hello --writable /tmp \
   -- /bin/nginx -c /etc/nginx/nginx.conf \
-  | jq '.spec.volumes=[{"name":"tmp","emptyDir":{}}]
-        | .spec.containers[0].volumeMounts=[{"name":"tmp","mountPath":"/tmp"}]' \
   | kubectl apply -f -
 ```
 
-The `jq` step exists because this nginx config writes to `/tmp`. The
-materialized root is read-only (SPEC §4.4), and the plugin does not yet
-generate volumes.
+`--writable /tmp` gives the pod an emptyDir at `/tmp`, which this nginx
+config writes to. The materialized root is read-only (SPEC §4.4), so any path
+a workload writes has to come from a mount.
 
 ## 5. Check the GC-root lifecycle
 

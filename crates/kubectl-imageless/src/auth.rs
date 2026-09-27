@@ -53,10 +53,14 @@ pub fn lookup(host: &str) -> Result<(Credential, CredentialSource), String> {
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Some(directory) = std::env::var_os("DOCKER_CONFIG") {
+    // Docker treats an empty variable as unset. Taken literally, an empty
+    // DOCKER_CONFIG names the relative `config.json` — whatever the working
+    // directory holds, credential helper included.
+    let set = |key| std::env::var_os(key).filter(|value| !value.is_empty());
+    if let Some(directory) = set("DOCKER_CONFIG") {
         return Some(PathBuf::from(directory).join("config.json"));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker/config.json"))
+    set("HOME").map(|home| PathBuf::from(home).join(".docker/config.json"))
 }
 
 /// Docker stores Docker Hub credentials under the legacy index URL, never
@@ -498,6 +502,24 @@ pub fn percent_encode(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one test that touches DOCKER_CONFIG: cargo runs tests as threads of
+    /// one process, so nothing else in this binary may set it.
+    #[test]
+    fn an_empty_docker_config_is_unset_not_the_working_directory() {
+        let previous = std::env::var_os("DOCKER_CONFIG");
+        std::env::set_var("DOCKER_CONFIG", "");
+        let resolved = config_path();
+        match previous {
+            Some(previous) => std::env::set_var("DOCKER_CONFIG", previous),
+            None => std::env::remove_var("DOCKER_CONFIG"),
+        }
+        let expected = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(".docker/config.json"));
+        assert_eq!(resolved, expected);
+        assert_ne!(resolved, Some(PathBuf::from("config.json")));
+    }
 
     fn fixture(label: &str, config: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(

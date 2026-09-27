@@ -31,7 +31,7 @@ mod podspec;
 mod registry;
 mod shebang;
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -151,6 +151,8 @@ const USAGE: &str =
      \x20 --plain-http          push over http:// to a non-loopback registry (localhost,\n\
      \x20                       *.localhost, 127.0.0.1 and [::1] use http automatically)\n\
      \x20 --dry-run             print digests and the pod manifest; no network\n\
+     \x20 --writable PATH       mount an emptyDir at PATH (repeatable) — the materialized\n\
+     \x20                       root is read-only, so this is where a workload writes\n\
      \x20 --emit-seed DIR       script only: write the generated seed (flake.nix,\n\
      \x20                       flake.lock, the script) to DIR and stop — the way out\n\
      \x20                       of shebang mode once the script outgrows it";
@@ -402,6 +404,8 @@ struct RunOptions {
     /// hatch out of this mode: a script that has outgrown a shebang becomes an
     /// ordinary directory here, with no step that only the plugin can perform.
     emit_seed: Option<String>,
+    /// Paths that get an emptyDir each: the materialized root is read-only.
+    writable: Vec<String>,
     command: Vec<String>,
 }
 
@@ -423,6 +427,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
     let mut plain_http = false;
     let mut dry_run = false;
     let mut emit_seed = None;
+    let mut writable: Vec<String> = Vec::new();
     let mut command = Vec::new();
 
     let mut iterator = arguments.iter();
@@ -456,6 +461,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             "--tag" => tag = Some(value("--tag")?),
             "--plain-http" => plain_http = true,
             "--dry-run" => dry_run = true,
+            "--writable" => writable.push(value("--writable")?),
             "--emit-seed" => {
                 let directory = value("--emit-seed")?;
                 // `create_dir_all("")` is an Ok no-op and `Path::new("").join(x)`
@@ -597,6 +603,22 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
             if external { "--external" } else { "--release" }
         ));
     }
+    // --emit-seed stops before anything is pushed, so these would be ignored:
+    // refused instead, like every other flag that cannot apply.
+    if emit_seed.is_some() {
+        for (flag, present) in [
+            ("--tag", tag.is_some()),
+            ("--plain-http", plain_http),
+            ("--dry-run", dry_run),
+            ("--writable", !writable.is_empty()),
+        ] {
+            if present {
+                return Err(format!(
+                    "{flag} does not apply to --emit-seed, which writes a seed and pushes nothing"
+                ));
+            }
+        }
+    }
     // `--image` pushes nothing, so there is no push target to validate — every
     // check below is about one.
     if let Some(repo) = &repo {
@@ -668,6 +690,7 @@ fn parse_run(arguments: &[String]) -> Result<ParsedRun, String> {
         plain_http,
         dry_run,
         emit_seed,
+        writable,
         command,
     })))
 }
@@ -763,6 +786,7 @@ fn run_release(options: &RunOptions, coordinate: &str) -> ExitCode {
         deploy: podspec::Deploy::Release(&reference),
         output: options.output.as_deref(),
         command: &options.command,
+        writable: &options.writable,
     })
 }
 
@@ -801,8 +825,12 @@ fn run_packed(options: &RunOptions, path: &Path) -> ExitCode {
                 .to_string(),
         );
     }
+    // `run_packed` routed here by following symlinks, so the packer must too:
+    // a symlink to a seed directory is that directory. Only the root is
+    // resolved — symlinks inside the tree are still refused by the packer.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let packed = match pack::pack_source(
-        path,
+        &resolved,
         &pack::PackOptions {
             include_vcs: options.include_vcs,
         },
@@ -863,6 +891,7 @@ fn run_packed(options: &RunOptions, path: &Path) -> ExitCode {
         deploy: podspec::Deploy::Source(podspec::EMBEDDED_SOURCE),
         output: options.output.as_deref(),
         command: &options.command,
+        writable: &options.writable,
     })
 }
 
@@ -1030,6 +1059,7 @@ fn run_script(options: &RunOptions, script: &Path) -> ExitCode {
         deploy: podspec::Deploy::Source(podspec::EMBEDDED_SOURCE),
         output: None,
         command: &command,
+        writable: &options.writable,
     })
 }
 
@@ -1039,18 +1069,30 @@ fn run_script(options: &RunOptions, script: &Path) -> ExitCode {
 fn write_seed(directory: &Path, seed: &generate::GeneratedSeed) -> Result<(), String> {
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?;
+    // `symlink_metadata`, not `exists`: a dangling symlink "does not exist",
+    // and writing through it would land outside DIR.
     for file in &seed.files {
         let path = directory.join(&file.name);
-        if path.exists() {
+        if std::fs::symlink_metadata(&path).is_ok() {
             return Err(format!("{}: already exists", path.display()));
         }
     }
     for file in &seed.files {
         let path = directory.join(&file.name);
-        std::fs::write(&path, &file.data)
+        // O_EXCL refuses any existing entry, a symlink included, so a path
+        // planted after the check above still is not written through.
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(file.mode)
+            .open(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let permissions = std::fs::Permissions::from_mode(file.mode);
-        std::fs::set_permissions(&path, permissions)
+        std::io::Write::write_all(&mut output, &file.data)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        // The mode given to open() is filtered by the umask; the seed's modes
+        // are part of what it hands over.
+        output
+            .set_permissions(std::fs::Permissions::from_mode(file.mode))
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
     Ok(())
@@ -1135,6 +1177,7 @@ fn run_external(options: &RunOptions, reference: &str) -> ExitCode {
         deploy: podspec::Deploy::Source(reference),
         output: options.output.as_deref(),
         command: &options.command,
+        writable: &options.writable,
     })
 }
 

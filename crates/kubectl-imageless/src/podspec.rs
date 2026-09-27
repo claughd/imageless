@@ -38,6 +38,8 @@ pub struct PodSpec<'a> {
     pub deploy: Deploy<'a>,
     pub output: Option<&'a str>,
     pub command: &'a [String],
+    /// Absolute container paths, each backed by its own emptyDir.
+    pub writable: &'a [String],
 }
 
 pub fn pod(spec: &PodSpec) -> Result<Value, String> {
@@ -91,21 +93,55 @@ pub fn pod(spec: &PodSpec) -> Result<Value, String> {
     if let Some(namespace) = spec.namespace {
         metadata["namespace"] = json!(namespace);
     }
+    let mut container = json!({
+        "name": "workload",
+        "image": spec.image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": spec.command,
+    });
+    let mut pod_spec = json!({
+        "runtimeClassName": spec.runtime_class,
+        "restartPolicy": "Never",
+    });
+    if !spec.writable.is_empty() {
+        let (volumes, mounts) = writable_volumes(spec.writable)?;
+        pod_spec["volumes"] = json!(volumes);
+        container["volumeMounts"] = json!(mounts);
+    }
+    pod_spec["containers"] = json!([container]);
     Ok(json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": metadata,
-        "spec": {
-            "runtimeClassName": spec.runtime_class,
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": "workload",
-                "image": spec.image,
-                "imagePullPolicy": "IfNotPresent",
-                "command": spec.command,
-            }],
-        },
+        "spec": pod_spec,
     }))
+}
+
+/// One emptyDir per writable path. The node forces the materialized root
+/// read-only (SPEC §4.4), so these are where a workload writes.
+fn writable_volumes(paths: &[String]) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut volumes = Vec::new();
+    let mut mounts = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let canonical = path.starts_with('/')
+            && path.len() > 1
+            && !path.ends_with('/')
+            && path[1..]
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..");
+        if !canonical {
+            return Err(format!(
+                "--writable {path}: must be an absolute, canonical path other than /"
+            ));
+        }
+        if paths[..index].contains(path) {
+            return Err(format!("--writable {path}: given twice"));
+        }
+        let name = format!("writable-{index}");
+        volumes.push(json!({ "name": name, "emptyDir": {} }));
+        mounts.push(json!({ "name": name, "mountPath": path }));
+    }
+    Ok((volumes, mounts))
 }
 
 /// RFC 1123 label: what the API server enforces for pod names.
@@ -175,6 +211,50 @@ mod tests {
             deploy: Deploy::Source(EMBEDDED_SOURCE),
             output: None,
             command,
+            writable: &[],
+        }
+    }
+
+    #[test]
+    fn writable_paths_become_emptydir_mounts_and_bad_ones_are_refused() {
+        let command = vec!["/bin/server".to_string()];
+        let writable = vec!["/tmp".to_string(), "/var/cache/app".to_string()];
+        let manifest = pod(&PodSpec {
+            writable: &writable,
+            ..spec(&command)
+        })
+        .unwrap();
+        assert_eq!(
+            manifest["spec"]["volumes"],
+            json!([
+                { "name": "writable-0", "emptyDir": {} },
+                { "name": "writable-1", "emptyDir": {} },
+            ])
+        );
+        assert_eq!(
+            manifest["spec"]["containers"][0]["volumeMounts"],
+            json!([
+                { "name": "writable-0", "mountPath": "/tmp" },
+                { "name": "writable-1", "mountPath": "/var/cache/app" },
+            ])
+        );
+        // Without the flag the manifest carries no volumes at all.
+        assert!(pod(&spec(&command)).unwrap()["spec"]
+            .get("volumes")
+            .is_none());
+        for bad in [
+            &["tmp"][..],
+            &["/"],
+            &["/tmp/"],
+            &["/a/../b"],
+            &["/tmp", "/tmp"],
+        ] {
+            let bad: Vec<String> = bad.iter().map(|path| path.to_string()).collect();
+            assert!(pod(&PodSpec {
+                writable: &bad,
+                ..spec(&command)
+            })
+            .is_err());
         }
     }
 
