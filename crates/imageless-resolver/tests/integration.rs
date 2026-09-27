@@ -374,6 +374,11 @@ fn runc(bundle: &Path, delegate: &Path, socket: &Path) -> Command {
         .env("IMAGELESS_RUNC", delegate)
         .env("IMAGELESS_RESOLVER_SOCKET", socket)
         .env("IMAGELESS_REALIZATION_TIMEOUT_SECONDS", "3")
+        // The fake store path does not exist and the build sandbox cannot
+        // mount, so these tests take the runtime's store path as the root.
+        // The root layer has its own tests (layer.rs) and the acceptance
+        // gates run it end to end.
+        .env("IMAGELESS_ROOT_LAYERS", "none")
         .args(["--root", "/run/runc-test", "create", "--bundle"])
         .arg(bundle)
         .args(["--pid-file", "/tmp/imageless-test.pid", "integration-test"]);

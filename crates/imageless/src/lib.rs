@@ -13,6 +13,7 @@ mod bundle;
 mod client;
 mod confine;
 mod gc;
+mod layer;
 mod materialize;
 mod minisign;
 mod mounts;
@@ -23,7 +24,8 @@ mod spec;
 
 pub use bundle::{
     apply_resolution, apply_resolution_with_projection, export_timing_events, prepare_bundle,
-    rewrite_root_path, AppliedResolution, BundleTimings, MaterializerConfig, PrepareBundle,
+    rewrite_root_path, root_layers_from_environment, AppliedResolution, BundleTimings,
+    MaterializerConfig, PrepareBundle,
 };
 #[cfg(feature = "daemon")]
 pub use client::{
@@ -33,6 +35,9 @@ pub use client::{
 #[cfg(feature = "daemon")]
 pub use confine::Confinement;
 pub use gc::{remove_bundle_gc_roots, remove_gc_root};
+pub use layer::{
+    sweep as sweep_root_layers, RootLayer, DEFAULT_ROOT_LAYER_DIRECTORY, ROOT_LAYER_DIRECTORY_ENV,
+};
 pub use materialize::{
     ClosurePathReport, ClosureReport, ContractError, ErrorCategory, Materialize, ResolutionError,
     ResolutionSuccess, ResolutionTimings, ResolvePurpose, ResolveRequest, ResolveResponse,

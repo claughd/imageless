@@ -209,11 +209,29 @@ A conforming runtime, at per-container `create`:
    needs writable paths gets them from mounts (`tmpfs`, volumes), never from
    the root. Process metadata is only applied when the release manifest
    explicitly requests it.
-5. **Projects the store.** The realized closure must be visible to the
+5. **Never lets the OCI runtime write into the store.** An OCI runtime
+   creates the destination of every mount inside the root before mounting
+   over it: `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`, a
+   service-account token directory, any volume. A store path can take none of
+   those writes. Where the store is read-only (NixOS, and any hardened node)
+   the create fails. Where it is writable, the runtime modifies a store path
+   in place, which invalidates its hash for every container and the node. So
+   `root.path` names a **mountpoint layer**: an overlay whose only lower
+   layer is the realized store path, with a small upper layer private to
+   the container that receives the runtime's mountpoints and nothing else,
+   because the root is still made read-only before the workload runs. The
+   layer stays mounted at its node path until the container is deleted,
+   because the OCI runtime keeps using that path (runc starts every `exec`
+   in it), and is released after that. The reference runtime stages layers
+   under a private mount point (`/run/imageless-roots`), ties each one to
+   the runc state file of the container created over it, and releases it
+   once that state is gone. The layer is not a writable root, and a later
+   revision that offered one would be a new opt-in.
+6. **Projects the store.** The realized closure must be visible to the
    container. Reference modes: `node` (bind the node's `/nix/store` read-only)
    or `closure` (read-only bind mounts scoped to the closure of the realized
    root, computed by the materializer).
-6. **Holds GC roots for the container's lifetime.** Materialization registers
+7. **Holds GC roots for the container's lifetime.** Materialization registers
    Nix GC roots tied to the bundle (`.imageless-rootfs-gcroot`,
    `.imageless-store-gcroots/`). Roots are released when creation fails, the
    delegate exits unsuccessfully, or the container is deleted. A live container

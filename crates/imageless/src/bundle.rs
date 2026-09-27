@@ -2,6 +2,7 @@
 
 use crate::client::{effective_uid, request_resolution_detailed};
 use crate::gc::remove_bundle_gc_roots;
+use crate::layer::{RootLayer, DEFAULT_ROOT_LAYER_DIRECTORY, ROOT_LAYER_DIRECTORY_ENV};
 use crate::materialize::{
     elapsed_us, ErrorCategory, ResolutionError, ResolutionSuccess, ResolveRequest,
 };
@@ -88,6 +89,22 @@ pub struct PrepareBundle {
     /// owner can never see. `None` disables the relay, and is the default:
     /// nothing is written unless a caller opts in with a path it parsed itself.
     pub runtime_log: Option<PathBuf>,
+    /// Where the writable mountpoint layer over the materialized root is
+    /// staged (SPEC §4.5); `None` hands the store path to the runtime as the
+    /// root, which is only sound where the store is mounted read-only and the
+    /// root already holds every mountpoint the container needs.
+    pub root_layers: Option<PathBuf>,
+}
+
+/// `IMAGELESS_ROOT_LAYERS`: unset for the default staging directory, `none`
+/// to hand the runtime the store path itself, or another absolute directory.
+pub fn root_layers_from_environment() -> Option<PathBuf> {
+    match std::env::var_os(ROOT_LAYER_DIRECTORY_ENV) {
+        None => Some(PathBuf::from(DEFAULT_ROOT_LAYER_DIRECTORY)),
+        Some(value) if value.is_empty() => Some(PathBuf::from(DEFAULT_ROOT_LAYER_DIRECTORY)),
+        Some(value) if value == "none" => None,
+        Some(value) => Some(PathBuf::from(value)),
+    }
 }
 
 impl PrepareBundle {
@@ -101,6 +118,7 @@ impl PrepareBundle {
             timeout_seconds: 300,
             materializer: MaterializerConfig::from_environment(),
             runtime_log: None,
+            root_layers: root_layers_from_environment(),
         }
     }
 }
@@ -218,6 +236,11 @@ pub struct BundleTimings {
 pub struct AppliedResolution {
     pub resolution: ResolvedRelease,
     pub timings: BundleTimings,
+    /// The mountpoint layer `root.path` now names. Once the runtime has
+    /// returned, the caller hands it to the container with
+    /// [`RootLayer::commit`], which releases it at once if no container was
+    /// made (SPEC §4.5).
+    pub root_layer: Option<RootLayer>,
 }
 
 /// Prepare an OCI bundle at `create`: select or pass through, materialize
@@ -270,7 +293,49 @@ pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResol
         io::Error::other(format!("resolution failed: {error}"))
     })?;
     let rewrite_started = Instant::now();
-    if let Err(error) = apply_resolution(&prepare.config_path, &success.resolution) {
+    let root_layer = match &prepare.root_layers {
+        Some(staging) if !staging.is_absolute() => {
+            let _ = remove_bundle_gc_roots(&prepare.bundle_path);
+            return Err(io::Error::other(format!(
+                "{ROOT_LAYER_DIRECTORY_ENV} must be an absolute directory or `none`"
+            )));
+        }
+        Some(staging) => match RootLayer::mount(Path::new(&success.resolution.rootfs), staging) {
+            Ok(layer) => Some(layer),
+            Err(error) => {
+                let _ = remove_bundle_gc_roots(&prepare.bundle_path);
+                if let Some(log) = &prepare.runtime_log {
+                    relay_failure(
+                        log,
+                        &ErrorCategory::Internal,
+                        "the node could not assemble the container root over its store path",
+                    );
+                }
+                return Err(io::Error::other(format!(
+                    "{:?}: could not mount the root layer under {}: {error}",
+                    ErrorCategory::Internal,
+                    staging.display()
+                )));
+            }
+        },
+        None => None,
+    };
+    let root_path = root_layer.as_ref().map_or_else(
+        || success.resolution.rootfs.clone(),
+        |layer| layer.root().to_string_lossy().into_owned(),
+    );
+    let applied = store_projection_for(&success.resolution).and_then(|projection| {
+        apply_resolution_rooted(
+            &prepare.config_path,
+            &success.resolution,
+            &projection,
+            &root_path,
+        )
+    });
+    if let Err(error) = applied {
+        if let Some(layer) = root_layer {
+            layer.detach();
+        }
         let _ = remove_bundle_gc_roots(&prepare.bundle_path);
         let diagnostic = error.to_string();
         if let Some(log) = &prepare.runtime_log {
@@ -293,6 +358,7 @@ pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResol
             evaluation_us: success.timings.evaluation_us,
             root_registration_us: success.timings.root_registration_us,
         },
+        root_layer,
     }))
 }
 
@@ -374,6 +440,17 @@ pub fn apply_resolution_with_projection(
     resolution: &ResolvedRelease,
     projection: &StoreProjection,
 ) -> io::Result<()> {
+    apply_resolution_rooted(config_path, resolution, projection, &resolution.rootfs)
+}
+
+/// The rewrite with `root.path` set to `root_path`: the store path itself, or
+/// the mountpoint layer over it.
+fn apply_resolution_rooted(
+    config_path: &Path,
+    resolution: &ResolvedRelease,
+    projection: &StoreProjection,
+    root_path: &str,
+) -> io::Result<()> {
     let text = std::fs::read_to_string(config_path)?;
     let permissions = std::fs::metadata(config_path)?.permissions();
     let mut document: serde_json::Value = serde_json::from_str(&text).map_err(to_io)?;
@@ -383,12 +460,12 @@ pub fn apply_resolution_with_projection(
         .ok_or_else(|| io::Error::other("config.json has no `root` object to rewrite"))?;
     root.insert(
         "path".into(),
-        serde_json::Value::String(resolution.rootfs.clone()),
+        serde_json::Value::String(root_path.to_string()),
     );
     // The new root is a store path shared with every other container and the
-    // node itself (SPEC §4.4): a writable root would let one workload rewrite
-    // what all of them run, wherever the node's /nix/store is not itself
-    // mounted read-only.
+    // node itself (SPEC §4.4), or an overlay whose only lower layer is one: a
+    // writable root would let one workload rewrite what all of them run,
+    // wherever the node's /nix/store is not itself mounted read-only.
     root.insert("readonly".into(), serde_json::Value::Bool(true));
 
     if let Some(metadata) = &resolution.process {

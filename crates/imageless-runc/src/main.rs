@@ -1,6 +1,9 @@
 //! runc-compatible imageless interposer for Docker and other OCI callers.
 
-use imageless::{export_timing_events, prepare_bundle, remove_bundle_gc_roots, PrepareBundle};
+use imageless::{
+    export_timing_events, prepare_bundle, remove_bundle_gc_roots, root_layers_from_environment,
+    sweep_root_layers, PrepareBundle,
+};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -137,6 +140,11 @@ fn runtime_log(arguments: &[String]) -> Option<PathBuf> {
     global_flag(arguments, "log")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+}
+
+/// runc's state directory: `--root`, or runc's default for root.
+fn runc_root(arguments: &[String]) -> PathBuf {
+    PathBuf::from(global_flag(arguments, "root").unwrap_or("/run/runc"))
 }
 
 fn create_bundle(arguments: &[String]) -> Result<Option<PathBuf>, String> {
@@ -304,7 +312,27 @@ fn main() {
 
     let delegate = delegate();
     let delegate_started = Instant::now();
-    let status = match run_delegate(&delegate, &arguments) {
+    let result = run_delegate(&delegate, &arguments);
+    // The root layer belongs to the container now, if the runtime made one:
+    // runc keeps using the root's node path (every `runc exec` starts in it),
+    // so it stays mounted until runc deletes the container. A failed create or
+    // a finished foreground `run` left no container, and the layer goes now
+    // (SPEC §4.5).
+    if let Some(layer) = applied
+        .as_mut()
+        .and_then(|applied| applied.root_layer.take())
+    {
+        layer.commit(&runc_root(&arguments));
+    }
+    // After a delete, the container's runc state is gone: release its layer.
+    if result.is_ok()
+        && subcommand_index(&arguments).map(|index| arguments[index].as_str()) == Some("delete")
+    {
+        if let Some(staging) = root_layers_from_environment() {
+            sweep_root_layers(&staging);
+        }
+    }
+    let status = match result {
         Ok(status) => status,
         Err(error) => {
             if let Some(bundle) = &bundle {

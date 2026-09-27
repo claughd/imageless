@@ -71,6 +71,10 @@ of arriving alongside the core the way they did in the incubation repo.
       v1.35.5+k3s1 / containerd 2.2.3: the seed pod, the plugin
       pack/push/apply path, and GC-while-running plus collect-after-delete.
       k3d and k3s releases on containerd 1.x are not covered.
+      Pods keep Kubernetes' default service-account token: runc's
+      mountpoints go to a per-container overlay layer over the store path
+      (SPEC §4.5), found when imgless's NixOS VM test hit the read-only
+      store. Earlier builds wrote those mountpoints into writable store paths.
       On NixOS, `services.imageless.k3s.enable` writes the same drop-in
       (both annotation families, `SystemdCgroup = true` for k3s as a systemd
       unit) and puts the shim's environment on the `k3s` unit. The module

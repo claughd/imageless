@@ -141,6 +141,31 @@ Read the root path from the bundle's `config.json`. `crictl inspect` shows
 containerd's spec before the rewrite, where the root path is still the
 relative `rootfs`.
 
+## Check that the store stayed intact
+
+The root a pod runs on is an overlay whose only lower layer is the store path
+(SPEC §4.5). The OCI runtime's mountpoints, such as `/etc/hosts` and the
+service-account token, land in a small per-container upper layer and never
+in the store:
+
+```sh
+store=$(readlink /run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/$cid/.imageless-rootfs-gcroot)
+nix-store --verify-path "$store" && echo "store path unmodified"
+```
+
+Builds before this layer existed let runc create those mountpoints inside
+the store path itself. On a read-only store (NixOS) that failed the create
+with `mkdirat …: read-only file system`. On a writable one it succeeded and
+modified the store path. `nix-store --verify --check-contents` reports paths
+modified that way, and `nix-store --repair-path <path>` restores them.
+
+The recipe was re-run with the store bind-mounted read-only, as NixOS mounts
+it, and a pod that keeps Kubernetes' default service-account token. The pod
+served, the token and `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf`
+were in place, `kubectl exec` worked, and the store path verified clean. The
+layer, one tmpfs and one overlay under `/run/imageless-roots`, was released
+when the pod was deleted. The GC checks in step 5 held too.
+
 ## Troubleshooting on unusual hosts
 
 - **`ErrImageNeverPull` after an import that succeeded.** Kubelet's image GC
