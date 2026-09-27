@@ -23,6 +23,12 @@ pub enum StoreProjection {
     /// per store path. The hardened backend: the workload sees exactly its own
     /// closure and no unrelated node store paths.
     Closure(Vec<String>),
+    /// Add no store mount: the runtime that consumes the bundle projects the
+    /// store itself. For embedding runtimes whose sandbox builds its own view of
+    /// `/nix/store` from `root.path` and refuses any bundle mount there (Cowboy's
+    /// nucleus cage). Workload mounts at or under `/nix/store` are still refused,
+    /// so the store view stays the runtime's alone.
+    Runtime,
 }
 
 pub(crate) fn client_nix_store() -> PathBuf {
@@ -70,10 +76,14 @@ pub fn enumerate_closure(nix_store: &Path, store_paths: &[&str]) -> io::Result<V
 
 /// Select the store-projection backend for a client bundle rewrite.
 /// `IMAGELESS_STORE_PROJECTION=closure` selects the hardened closure-scoped
-/// backend; any other value (or unset) keeps the whole-node compatibility bind,
-/// which stays the explicit fallback.
+/// backend and `runtime` leaves the store to the consuming runtime; any other
+/// value (or unset) keeps the whole-node compatibility bind, which stays the
+/// explicit fallback. Embedders that always project the store themselves set
+/// [`crate::PrepareBundle::runtime_supplies_store`] instead of relying on the
+/// node's environment.
 pub fn store_projection_for(resolution: &ResolvedRelease) -> io::Result<StoreProjection> {
     match std::env::var("IMAGELESS_STORE_PROJECTION").ok().as_deref() {
+        Some("runtime") => Ok(StoreProjection::Runtime),
         Some("closure") => {
             let seeds: Vec<&str> = resolution.store_paths().collect();
             let closure = enumerate_closure(&client_nix_store(), &seeds)?;
@@ -141,8 +151,9 @@ pub(crate) fn apply_store_mounts(
 /// their dynamic loaders live there.
 ///
 /// [`StoreProjection::Node`] binds the whole store (compatibility);
-/// [`StoreProjection::Closure`] binds only the selected closure paths (hardened).
-/// The workload-mount conflict check is identical for both backends.
+/// [`StoreProjection::Closure`] binds only the selected closure paths (hardened);
+/// [`StoreProjection::Runtime`] adds nothing, for a runtime that projects the
+/// store itself. The workload-mount conflict check is identical for all three.
 pub(crate) fn apply_node_store_projection(
     document: &mut serde_json::Value,
     projection: &StoreProjection,
@@ -198,6 +209,7 @@ pub(crate) fn apply_node_store_projection(
         }
     }
     match projection {
+        StoreProjection::Runtime => {}
         StoreProjection::Node => {
             mounts.push(serde_json::json!({
                 "destination": NIX_STORE_PATH,
@@ -389,6 +401,51 @@ printf '%s\n' "/nix/store/11111111111111111111111111111111-libc""#,
             &StoreProjection::Closure(closure),
         )
         .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_projection_adds_no_store_mount_and_still_refuses_workload_ones() {
+        let dir = temporary("runtime-projection");
+        let config = dir.join("config.json");
+        let original = serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["placeholder"] },
+            "mounts": [{ "destination": "/data", "source": "tmpfs", "type": "tmpfs" }]
+        });
+        std::fs::write(&config, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        let resolution = ResolvedRelease {
+            identity: "test/agent@sha256:00".to_string(),
+            rootfs: STORE.to_string(),
+            process: None,
+            mounts: Vec::new(),
+        };
+        apply_resolution_with_projection(&config, &resolution, &StoreProjection::Runtime).unwrap();
+        let applied: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        // The root is rewritten as with any backend, and the workload's own
+        // mounts are untouched, but nothing is mounted at or under the store:
+        // a runtime that builds its own store view (and refuses bundle mounts
+        // there) gets a bundle it can accept.
+        assert_eq!(applied["root"]["path"], STORE);
+        assert_eq!(applied["root"]["readonly"], true);
+        let mounts = applied["mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["destination"], "/data");
+
+        // The store view stays the runtime's alone: a workload mount there is
+        // still refused.
+        let mut conflicting = original.clone();
+        conflicting["mounts"] = serde_json::json!([
+            { "destination": "/nix/store/x", "source": "/host", "type": "bind" }
+        ]);
+        std::fs::write(&config, serde_json::to_vec_pretty(&conflicting).unwrap()).unwrap();
+        let error =
+            apply_resolution_with_projection(&config, &resolution, &StoreProjection::Runtime)
+                .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         std::fs::remove_dir_all(dir).unwrap();

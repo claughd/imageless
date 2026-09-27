@@ -94,6 +94,12 @@ pub struct PrepareBundle {
     /// root, which is only sound where the store is mounted read-only and the
     /// root already holds every mountpoint the container needs.
     pub root_layers: Option<PathBuf>,
+    /// The runtime consuming this bundle projects `/nix/store` itself (SPEC
+    /// §4 obligation 6, `runtime` mode), so the rewrite adds no store mount.
+    /// Set by embedders whose sandbox builds its own store view and refuses
+    /// bundle mounts there. `false` (the default) leaves the choice to the
+    /// node's `IMAGELESS_STORE_PROJECTION`.
+    pub runtime_supplies_store: bool,
 }
 
 /// `IMAGELESS_ROOT_LAYERS`: unset for the default staging directory, `none`
@@ -119,6 +125,7 @@ impl PrepareBundle {
             materializer: MaterializerConfig::from_environment(),
             runtime_log: None,
             root_layers: root_layers_from_environment(),
+            runtime_supplies_store: false,
         }
     }
 }
@@ -324,7 +331,12 @@ pub fn prepare_bundle(prepare: &PrepareBundle) -> io::Result<Option<AppliedResol
         || success.resolution.rootfs.clone(),
         |layer| layer.root().to_string_lossy().into_owned(),
     );
-    let applied = store_projection_for(&success.resolution).and_then(|projection| {
+    let projection = if prepare.runtime_supplies_store {
+        Ok(StoreProjection::Runtime)
+    } else {
+        store_projection_for(&success.resolution)
+    };
+    let applied = projection.and_then(|projection| {
         apply_resolution_rooted(
             &prepare.config_path,
             &success.resolution,

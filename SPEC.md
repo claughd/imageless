@@ -241,9 +241,12 @@ A conforming runtime, at per-container `create`:
    once that state is gone. The layer is not a writable root, and a later
    revision that offered one would be a new opt-in.
 6. **Projects the store.** The realized closure must be visible to the
-   container. Reference modes: `node` (bind the node's `/nix/store` read-only)
-   or `closure` (read-only bind mounts scoped to the closure of the realized
-   root, computed by the materializer).
+   container. Reference modes: `node` (bind the node's `/nix/store` read-only),
+   `closure` (read-only bind mounts scoped to the closure of the realized
+   root, computed by the materializer), or `runtime` (the rewrite adds no store
+   mount, because the runtime consuming the bundle projects the store itself,
+   as an embedding sandbox that builds its own view from `root.path` does). In
+   every mode the rewrite refuses workload mounts at or under `/nix/store`.
 7. **Holds GC roots for the container's lifetime.** Materialization registers
    Nix GC roots tied to the bundle (`.imageless-rootfs-gcroot`,
    `.imageless-store-gcroots/`). Roots are released when creation fails, the
@@ -391,7 +394,7 @@ deployer, or runtime can observe:
 - The embedded convention (§2): `etc/imageless/flake.nix` as a regular file,
   zero-config selection of `/etc/imageless#rootfs`, and the staging bounds
   (16 MiB, 4096 entries, regular files and directories only, no symlinks).
-- The runtime obligations (§4), including both store projection modes and the
+- The runtime obligations (§4), including the three store projection modes and the
   GC-root names (`.imageless-rootfs-gcroot`, `.imageless-store-gcroots/`).
 - The release profile (§6): the `imageless.release.v1` manifest schema,
   canonical-JSON digest addressing, the `sha256/<digest>.json` catalog layout
