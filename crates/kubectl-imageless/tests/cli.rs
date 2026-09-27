@@ -429,3 +429,120 @@ fn a_file_that_is_neither_a_seed_nor_a_shebang_says_so() {
     assert!(stderr.contains("flake.nix"), "{stderr}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn scratch(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "kubectl-imageless-cli-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn shebang_script(root: &std::path::Path) -> PathBuf {
+    let script = root.join("hello.py");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env nix\n#! nix shell nixpkgs#python3 --command python3\nprint('hello')\n",
+    )
+    .unwrap();
+    script
+}
+
+#[test]
+fn emit_seed_refuses_flags_it_would_otherwise_ignore() {
+    let root = scratch("emit-flags");
+    let script = shebang_script(&root);
+    for extra in [
+        &["--tag", "v1"][..],
+        &["--plain-http"],
+        &["--dry-run"],
+        &["--writable", "/tmp"],
+    ] {
+        let output = binary()
+            .args(["run", script.to_str().unwrap(), "--unpinned", "--emit-seed"])
+            .arg(root.join("seed"))
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{extra:?} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(extra[0]), "{stderr}");
+        assert!(!root.join("seed").exists(), "{extra:?} still wrote a seed");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn emit_seed_never_writes_through_a_dangling_symlink() {
+    let root = scratch("emit-dangling");
+    let script = shebang_script(&root);
+    let seed = root.join("seed");
+    std::fs::create_dir(&seed).unwrap();
+    let outside = root.join("outside.nix");
+    std::os::unix::fs::symlink(&outside, seed.join("flake.nix")).unwrap();
+    let output = binary()
+        .args(["run", script.to_str().unwrap(), "--unpinned", "--emit-seed"])
+        .arg(&seed)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
+    assert!(!outside.exists(), "the symlink's target was written");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_symlink_to_a_seed_directory_packs_that_directory() {
+    let root = scratch("symlinked-seed");
+    let real = seed("symlinked-seed-target");
+    let link = root.join("app");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let output = binary()
+        .arg("run")
+        .arg(&link)
+        .args([
+            "--repo",
+            "registry.example/team/app",
+            "--dry-run",
+            "--",
+            "/bin/server",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(real).unwrap();
+}
+
+#[test]
+fn writable_paths_reach_the_pod_manifest() {
+    let root = seed("writable");
+    let output = binary()
+        .arg("run")
+        .arg(&root)
+        .args([
+            "--repo",
+            "registry.example/team/app",
+            "--dry-run",
+            "--writable",
+            "/tmp",
+            "--",
+            "/bin/server",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pod: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        pod["spec"]["containers"][0]["volumeMounts"][0]["mountPath"],
+        "/tmp"
+    );
+    assert_eq!(pod["spec"]["volumes"][0]["emptyDir"], serde_json::json!({}));
+    std::fs::remove_dir_all(root).unwrap();
+}

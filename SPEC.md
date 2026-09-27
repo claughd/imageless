@@ -32,7 +32,7 @@ An image opts in by carrying a flake at a conventional path in its layers:
 rootfs/
 └── etc/imageless/
     ├── flake.nix          # required for the zero-config path
-    ├── flake.lock         # optional, strongly recommended
+    ├── flake.lock         # required when the flake has inputs (§2.3)
     └── ...                # any source files the flake references
 ```
 
@@ -78,6 +78,43 @@ bundle rootfs. The staged tree is bounded: at most 16 MiB and 4096 entries,
 regular files and directories only (symlinks are rejected). The staged copy is
 what the materializer evaluates; the container never controls paths outside its
 own rootfs.
+
+The rejection covers the path *to* the source as well as the tree under it. The
+runtime reads the rootfs from the host, where an image symlink such as
+`/a -> /` resolves against the node's root, so a source whose in-image path
+passes through any symlink fails the create. Zero-config discovery (§2.1) does
+not fail on a symlinked `etc` or `etc/imageless`; the image simply carries no
+embedded flake there and passes through.
+
+### 2.4 Evaluation confinement and locked inputs
+
+Staging bounds what the installable names; it cannot bound what the flake's own
+inputs name, and Nix fetches inputs — direct or transitive, `path:` and
+`file://` among them — from whatever filesystem the evaluator can see. The
+reference materializer therefore evaluates in private mount and PID
+namespaces. The root holds only the store, the system program and library
+trees, and the `/etc` entries Nix needs (its configuration, TLS roots, name
+resolution, account lookup). It also holds the character devices Nix opens
+(`null`, `zero`, `full`, `random`, `urandom`, `tty`), a private devpts
+instance, a procfs mounted from inside the new PID namespace, a private
+`/tmp`, the staged source, and the evaluator's fetcher and pending-root
+scratch. The host's `/proc` and `/dev` are never exposed. In the host PID
+namespace, `/proc/<pid>/root` would lead back to the node's filesystem. A
+node-local input resolves against that root and reaches nothing of the
+node's. The evaluator is PID 1 of its namespace, so nothing it spawns outlives
+it. A node that cannot create mount namespaces must
+say so in its policy (`unconfined_evaluation: true`); the default fails the
+create instead. TLS roots outside the allowlist must be named through
+`NIX_SSL_CERT_FILE`, which the evaluator binds.
+
+An in-image flake evaluates against the lock it ships
+(`--no-update-lock-file`): a flake with inputs and no complete `flake.lock`
+fails the create, and a lock that pins a node-local input — an absolute or
+`..`-escaping `path`, or any `file:` URL — is refused before evaluation, naming
+the input. Development nodes may set `allow_unlocked_inputs: true` to let the
+node lock such a seed at evaluation time; confinement still applies. External
+references (§3) are confined the same way; their own lock is honored as
+written.
 
 ## 3. Annotations (highest precedence)
 
@@ -160,7 +197,10 @@ A conforming runtime, at per-container `create`:
 4. **Rewrites atomically.** `root.path` in `config.json` is replaced via
    write-to-temp + rename, preserving file mode and fsyncing the file and its
    parent directory. Unrelated OCI fields are preserved byte-for-byte where not
-   rewritten. Process metadata is only applied when the release manifest
+   rewritten. `root.readonly` is forced to `true`: the new root is a store path
+   shared with every other container and the node itself, so a workload that
+   needs writable paths gets them from mounts (`tmpfs`, volumes), never from
+   the root. Process metadata is only applied when the release manifest
    explicitly requests it.
 5. **Projects the store.** The realized closure must be visible to the
    container. Reference modes: `node` (bind the node's `/nix/store` read-only)

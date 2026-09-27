@@ -299,15 +299,10 @@ evaluates embedded flakes. Production nodes keep the shipped fail-closed
 default (`cache_only: true`) and resolve digest-addressed releases — see
 "Who runs the evaluation" in the top-level README and SPEC.md.
 
-## k3d / k3s
+## k3s
 
-Deliberately deferred: k3s regenerates containerd's config on every start,
-and customizing it goes through a `config.toml.tmpl` whose correct variant
-(`config-v3.toml.tmpl` vs `config.toml.tmpl`) depends on the k3s release's
-containerd generation — a version matrix that doubles this document for
-zero additional coverage, since the seam being demonstrated (a `BinaryName`
-under the stock runc-v2 shim) is identical. The shape of the port is known
-(template the base config + the runtime table, `k3d image import`, volume
-mounts for store and policy); now that `kubectl imageless run` pushes —
-loopback registries are plain HTTP with zero flags — `k3d --registry-create`
-is the easiest local-registry path, which is the main reason to revisit.
+See `dev/k3s/`. The template problem that kept k3s out of this document went
+away: k3s's generated containerd config imports `config-v3.toml.d/*.toml`, and
+a drop-in placed there adds the runtime handler without a template. That
+recipe runs k3s directly on the host, not inside Docker. k3d is still not
+covered.

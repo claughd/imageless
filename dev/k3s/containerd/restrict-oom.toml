@@ -1,0 +1,10 @@
+# containerd drop-in for hosts that withhold CAP_SYS_RESOURCE even from root
+# (some VM and sandbox hosts). kubelet asks for oom_score_adj -998 on every pod
+# sandbox; lowering a score needs that capability, so without this every
+# sandbox fails with "failed to update /proc/self/oom_score_adj: Permission
+# denied". Clamping to the caller's own score is what containerd does in user
+# namespaces. setup.sh installs this only when the capability is missing.
+version = 3
+
+[plugins.'io.containerd.cri.v1.runtime']
+  restrict_oom_score_adj = true

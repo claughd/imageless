@@ -1,0 +1,6 @@
+# /etc/rancher/k3s/registries.yaml: let the node pull the plain-HTTP loopback
+# registry `kubectl imageless run --repo 127.0.0.1:5000/...` pushes to.
+# Installed by `setup.sh --registry`; k3s reads it at start.
+mirrors:
+  "127.0.0.1:5000":
+    endpoint: ["http://127.0.0.1:5000"]

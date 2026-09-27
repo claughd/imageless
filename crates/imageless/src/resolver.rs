@@ -2,13 +2,16 @@
 //! development-source staging pipeline, and the UNIX-socket server.
 
 use crate::client::{effective_uid, peer_allowed, peer_uid, read_frame, write_frame};
+use crate::confine::Confinement;
 use crate::gc::{gc_root_path, prepare_gc_root, remove_bundle_gc_roots, validate_registered_root};
 use crate::materialize::{
     elapsed_us, remaining, ClosurePathReport, ClosureReport, ErrorCategory, Materialize,
     ResolutionError, ResolutionSuccess, ResolutionTimings, ResolvePurpose, ResolveRequest,
     ResolveResponse,
 };
-use crate::nix::{parse_materialized_path, run_command, validate_realise_output};
+use crate::nix::{
+    parse_materialized_path, run_command, run_command_confined, validate_realise_output,
+};
 use crate::release::{self, CachePolicy, ReleaseReference, ResolvedRelease, ResolverPolicy};
 use crate::spec::{validate_output, validate_store_path};
 use crate::{
@@ -101,6 +104,8 @@ impl ResolverConfig {
                 cache_only: true,
                 eval_allowed_uri_prefixes: Vec::new(),
                 issuers: HashMap::new(),
+                unconfined_evaluation: false,
+                allow_unlocked_inputs: false,
             },
             development_worker: None,
             evaluate_as_caller: false,
@@ -178,6 +183,8 @@ fn in_process_policy(
                         cache_only: true,
                         eval_allowed_uri_prefixes: Vec::new(),
                         issuers: HashMap::new(),
+                        unconfined_evaluation: false,
+                        allow_unlocked_inputs: false,
                     },
                     true,
                 )),
@@ -363,47 +370,58 @@ impl Resolver {
         let substitution_started = Instant::now();
 
         let key = request.materialize.key();
-        let (flight, leader) = {
-            let mut flights = self.inner.flights.lock().unwrap();
-            if let Some(flight) = flights.get(&key) {
-                flight.state.lock().unwrap().callers += 1;
-                (Arc::clone(flight), false)
+        let result = loop {
+            let (flight, leader) = self.join_flight(&key);
+            let result = if leader {
+                let result = self.materialize(
+                    &request.materialize,
+                    selected.as_ref(),
+                    &bundle,
+                    deadline,
+                    &clock,
+                );
+                // A failure is the leader's own: its deadline, its bundle, a
+                // fetch that may succeed a moment later. Unpublish the flight
+                // before waking anyone, so no later arrival joins a result that
+                // is already an error.
+                if result.is_err() {
+                    self.forget_flight(&key, &flight);
+                }
+                let mut state = flight.state.lock().unwrap();
+                state.result = Some(result.clone());
+                flight.ready.notify_all();
+                result
             } else {
-                let flight = Arc::new(Flight {
-                    state: Mutex::new(FlightState {
-                        callers: 1,
-                        result: None,
-                    }),
-                    ready: Condvar::new(),
-                });
-                flights.insert(key.clone(), Arc::clone(&flight));
-                (flight, true)
-            }
-        };
-
-        let result = if leader {
-            let result = self.materialize(
-                &request.materialize,
-                selected.as_ref(),
-                &bundle,
-                deadline,
-                &clock,
-            );
-            let mut state = flight.state.lock().unwrap();
-            state.result = Some(result.clone());
-            flight.ready.notify_all();
-            result
-        } else {
-            match wait_for_flight(&flight, deadline) {
-                Ok(resolution) => self.register_resolution(&resolution, &bundle, deadline, &clock),
-                Err(error) => Err(error),
+                match wait_for_flight(&flight, deadline) {
+                    Ok(resolution) => {
+                        self.register_resolution(&resolution, &bundle, deadline, &clock)
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            self.release_flight(&key, &flight);
+            // A follower that inherited a retryable failure — typically the
+            // leader running out of its own, shorter deadline — tries again on
+            // its own clock rather than failing with someone else's error. A
+            // policy or contract error is the same for every caller of this
+            // key, so it is shared as before. Rejoining can only make this
+            // caller a leader or a follower of a fresh flight, and leaders
+            // never loop, so each follower retries at most once per failure.
+            match &result {
+                Err(error)
+                    if !leader
+                        && error.retryable
+                        && remaining(deadline, "before retrying a failed realization").is_ok() =>
+                {
+                    continue
+                }
+                _ => break result,
             }
         };
 
         if result.is_err() {
             let _ = remove_bundle_gc_roots(&bundle);
         }
-        self.release_flight(&key, &flight);
         result.map(|resolution| ResolutionSuccess {
             resolution,
             timings: ResolutionTimings {
@@ -695,12 +713,31 @@ impl Resolver {
             .as_ref()
             .map(|(installable, _guard)| installable.as_str())
             .unwrap_or(installable);
+        let policy = &self.inner.config.policy;
+        let staged_directory = staged.as_ref().map(|(_, guard)| guard.directory.clone());
+        if let Some(directory) = &staged_directory {
+            refuse_local_locked_inputs(directory)?;
+        }
+        // An in-image flake evaluates against the lock it ships. Nix fetches an
+        // unlocked input before `--no-update-lock-file` refuses it, which is
+        // why this gate relies on the confinement below rather than replacing
+        // it: the refused fetch can reach nothing of the node's.
+        let locked = staged_directory.is_some() && !policy.allow_unlocked_inputs;
+        let confinement_root = if policy.unconfined_evaluation {
+            None
+        } else {
+            Some(create_confinement_root()?)
+        };
         let timeout = remaining(deadline, "before development source evaluation")?;
         let timeout_seconds = timeout.as_secs().max(1).to_string();
-        // Guard slot, not dead code: the worker's cache directory must survive
-        // until `run_command` returns, and the command is built inside the
-        // block below.
+        // Guard slots, not dead code: the worker's cache directory and the
+        // in-process pending-root directory hold the build's indirect GC root,
+        // so they must survive until the bundle's own root is registered below
+        // — the end of this function — and the command is built inside the
+        // block that follows.
         let mut _worker_cache = None;
+        let mut _pending_root = None;
+        let mut confinement_plan = None;
         let stdout = {
             let _permit =
                 self.acquire_permit(deadline, "while waiting for a development Nix operation")?;
@@ -719,38 +756,90 @@ impl Resolver {
                         .arg(&cache.directory)
                         .arg("--installable")
                         .arg(evaluation_installable)
+                        // The worker's own scratch, which it can write and which
+                        // is bound into its confinement: the build holds an
+                        // indirect GC root there until ours is registered.
+                        .arg("--out-link")
+                        .arg(cache.directory.join("pending-root"))
                         .env_clear();
+                    if let Some(root) = &confinement_root {
+                        command.arg("--confine-root").arg(&root.directory);
+                    }
+                    if locked {
+                        command.arg("--locked");
+                    }
                     _worker_cache = Some(cache);
                     command
                 }
                 None => {
-                    let mut command = Command::new(&self.inner.config.nix);
+                    let nix = resolve_program(&self.inner.config.nix)?;
+                    let pending = PendingRootDirectory {
+                        directory: create_private_directory("pending-root", "a pending GC root")?,
+                    };
+                    let pending_link = pending.directory.join("result");
+                    let pending_directory = pending.directory.clone();
+                    _pending_root = Some(pending);
+                    let mut command = Command::new(&nix);
                     command
                         .args([
                             "--extra-experimental-features",
                             "nix-command flakes",
                             "build",
-                            "--no-link",
                             "--print-out-paths",
+                            "--out-link",
                         ])
-                        .arg(evaluation_installable);
+                        .arg(&pending_link);
+                    if locked {
+                        command.arg("--no-update-lock-file");
+                    }
+                    command.arg(evaluation_installable);
+                    if let Some(root) = &confinement_root {
+                        let certificates: Vec<PathBuf> = ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE"]
+                            .into_iter()
+                            .filter_map(std::env::var_os)
+                            .map(PathBuf::from)
+                            .collect();
+                        let writable: Vec<PathBuf> = staged_directory
+                            .iter()
+                            .cloned()
+                            .chain([pending_directory])
+                            .collect();
+                        let confinement = Confinement::for_evaluation(
+                            &root.directory,
+                            &nix,
+                            &writable,
+                            &certificates,
+                        )
+                        .map_err(|error| {
+                            ResolutionError::new(
+                                ErrorCategory::Internal,
+                                format!("could not plan evaluation confinement: {error}"),
+                                false,
+                            )
+                        })?;
+                        confinement_plan = Some(confinement);
+                    }
                     command
                 }
             };
             let budget = remaining(deadline, "during development source evaluation")?;
-            StageClock::time(&clock.evaluation_us, || run_command(&mut command, budget)).map_err(
-                |error| match error.kind() {
-                    io::ErrorKind::TimedOut => ResolutionError::timeout_with(
-                        "during development source evaluation",
-                        &error.to_string(),
+            StageClock::time(&clock.evaluation_us, || {
+                run_command_confined(&mut command, budget, confinement_plan.take())
+            })
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::TimedOut => ResolutionError::timeout_with(
+                    "during development source evaluation",
+                    &error.to_string(),
+                ),
+                _ => ResolutionError::new(
+                    ErrorCategory::Materialization,
+                    format!(
+                        "the development resolver could not evaluate the source: {error}{}",
+                        evaluation_hint(&error.to_string(), confinement_root.is_some())
                     ),
-                    _ => ResolutionError::new(
-                        ErrorCategory::Materialization,
-                        format!("the development resolver could not evaluate the source: {error}"),
-                        true,
-                    ),
-                },
-            )?
+                    true,
+                ),
+            })?
         };
         let store_path = parse_materialized_path(&stdout).map_err(|_| {
             ResolutionError::new(
@@ -1233,6 +1322,36 @@ impl Resolver {
         })
     }
 
+    /// Join the in-progress flight for `key`, or publish a new one and lead it.
+    fn join_flight(&self, key: &str) -> (Arc<Flight>, bool) {
+        let mut flights = self.inner.flights.lock().unwrap();
+        if let Some(flight) = flights.get(key) {
+            flight.state.lock().unwrap().callers += 1;
+            return (Arc::clone(flight), false);
+        }
+        let flight = Arc::new(Flight {
+            state: Mutex::new(FlightState {
+                callers: 1,
+                result: None,
+            }),
+            ready: Condvar::new(),
+        });
+        flights.insert(key.to_string(), Arc::clone(&flight));
+        (flight, true)
+    }
+
+    /// Unpublish `flight` so the next caller for `key` starts a fresh one;
+    /// callers already waiting on it still receive its result.
+    fn forget_flight(&self, key: &str, flight: &Arc<Flight>) {
+        let mut flights = self.inner.flights.lock().unwrap();
+        if flights
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(key);
+        }
+    }
+
     fn release_flight(&self, key: &str, flight: &Arc<Flight>) {
         let remove = {
             let mut state = flight.state.lock().unwrap();
@@ -1240,13 +1359,7 @@ impl Resolver {
             state.callers == 0
         };
         if remove {
-            let mut flights = self.inner.flights.lock().unwrap();
-            if flights
-                .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, flight))
-            {
-                flights.remove(key);
-            }
+            self.forget_flight(key, flight);
         }
     }
 }
@@ -1334,6 +1447,173 @@ fn validate_installable(installable: &str) -> Result<(), ResolutionError> {
         ));
     }
     Ok(())
+}
+
+/// An empty directory the evaluator's confined root is mounted over — inside
+/// the evaluator's own mount namespace only, so from here it stays empty and is
+/// removed when the evaluation is over.
+struct ConfinementRoot {
+    directory: PathBuf,
+}
+
+impl Drop for ConfinementRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+fn create_confinement_root() -> Result<ConfinementRoot, ResolutionError> {
+    create_private_directory("confine", "evaluation confinement")
+        .map(|directory| ConfinementRoot { directory })
+}
+
+/// Where an in-process evaluation's `nix build --out-link` lands. The link is
+/// an indirect GC root from the moment the build finishes, so the output
+/// cannot be collected in the window before the bundle's own root exists; the
+/// directory (and the then-redundant link) goes when the evaluation is over.
+struct PendingRootDirectory {
+    directory: PathBuf,
+}
+
+impl Drop for PendingRootDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// A fresh 0700 directory under the temp dir, named for `label`.
+fn create_private_directory(label: &str, purpose: &str) -> Result<PathBuf, ResolutionError> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let failed = |error: io::Error| {
+        ResolutionError::new(
+            ErrorCategory::Internal,
+            format!("could not prepare {purpose}: {error}"),
+            true,
+        )
+    };
+    for _ in 0..128 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!(".imageless-{label}-{}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                if let Err(error) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(failed(error));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(failed(error)),
+        }
+    }
+    Err(ResolutionError::new(
+        ErrorCategory::Internal,
+        format!("{purpose} namespace exhausted"),
+        true,
+    ))
+}
+
+/// The confined root holds only absolute paths, so a bare program name is
+/// resolved against PATH here, where the host's PATH is still visible.
+fn resolve_program(program: &Path) -> Result<PathBuf, ResolutionError> {
+    if program.is_absolute() {
+        return Ok(program.to_path_buf());
+    }
+    if program.components().count() == 1 {
+        if let Some(found) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(program))
+                .find(|candidate| candidate.is_file())
+        }) {
+            return Ok(found);
+        }
+    }
+    Err(ResolutionError::new(
+        ErrorCategory::Internal,
+        format!("could not locate the Nix client `{}`", program.display()),
+        false,
+    ))
+}
+
+/// Point a failed evaluation at the node setting that explains it.
+fn evaluation_hint(error: &str, confined: bool) -> &'static str {
+    // Under confinement an unlocked local input fails while Nix is still
+    // locking it, before `--no-update-lock-file` gets to refuse the change.
+    if error.contains("requires lock file changes")
+        || error.contains("while updating the lock file")
+    {
+        "; an in-image flake with inputs must ship a complete flake.lock \
+         (or the node policy must set allow_unlocked_inputs)"
+    } else if confined && error.contains("Operation not permitted") {
+        "; evaluation runs in a private mount namespace, and a node that cannot \
+         create one must set unconfined_evaluation in its policy"
+    } else {
+        ""
+    }
+}
+
+/// Refuse a staged flake.lock that pins a node-local input: an absolute or
+/// `..`-escaping `path` input, or any `file:` URL. Such an input names the
+/// node's filesystem, which an image never controls (SPEC §2.3). Confinement
+/// already denies the read; this turns it into a diagnostic that names the
+/// input, before Nix runs.
+fn refuse_local_locked_inputs(directory: &Path) -> Result<(), ResolutionError> {
+    let bytes = match std::fs::read(directory.join("flake.lock")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(staging_error(error)),
+    };
+    let invalid =
+        |reason: String| ResolutionError::new(ErrorCategory::InvalidRequest, reason, false);
+    let lock: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("embedded flake.lock is not valid JSON".to_string()))?;
+    let nodes = lock
+        .get("nodes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| invalid("embedded flake.lock has no nodes".to_string()))?;
+    for (name, node) in nodes {
+        let Some(locked) = node.get("locked") else {
+            continue;
+        };
+        if let Some(reason) = local_lock_reason(locked) {
+            let name: String = name
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(64)
+                .collect();
+            return Err(invalid(format!(
+                "embedded flake.lock input `{name}` {reason}; an in-image flake may not lock \
+                 node-local inputs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn local_lock_reason(locked: &serde_json::Value) -> Option<&'static str> {
+    let field = |key: &str| locked.get(key).and_then(serde_json::Value::as_str);
+    if field("type") == Some("path") {
+        let path = field("path").unwrap_or("");
+        if path.starts_with('/') {
+            return Some("is an absolute path");
+        }
+        if path.split('/').any(|part| part == "..") {
+            return Some("escapes its flake with `..`");
+        }
+    }
+    if let Some(url) = field("url") {
+        if url.starts_with('/')
+            || url
+                .get(..5)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        {
+            return Some("is a local file URL");
+        }
+    }
+    None
 }
 
 struct StagedDevelopmentSource {
@@ -2003,10 +2283,10 @@ mod tests {
             leader.join().unwrap().unwrap_err().category,
             ErrorCategory::Materialization
         );
-        assert_eq!(
-            follower.unwrap_err().category,
-            ErrorCategory::Materialization
-        );
+        // The failure was the leader's (exit 7 is a retryable Materialization
+        // error): the follower retries on its own deadline instead of
+        // inheriting it, and the failed flight is gone for later callers.
+        assert_eq!(follower.unwrap().rootfs, STORE);
         assert_eq!(
             resolver
                 .resolve(request(two, Materialize::Closure(STORE.into()), 2000))
@@ -2235,6 +2515,86 @@ rmdir "{state}/lock"
     }
 
     #[test]
+    fn staged_locks_may_not_pin_node_local_inputs() {
+        let dir = temporary("staged-lock");
+        let lock = |nodes: serde_json::Value| {
+            std::fs::write(
+                dir.join("flake.lock"),
+                serde_json::to_vec(
+                    &serde_json::json!({ "nodes": nodes, "root": "root", "version": 7 }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            refuse_local_locked_inputs(&dir)
+        };
+        // No lock at all is the lock-less seed: gated by --no-update-lock-file
+        // under confinement, not here.
+        assert!(refuse_local_locked_inputs(&dir).is_ok());
+        // Remote inputs and in-tree relative subflakes are ordinary.
+        assert!(lock(serde_json::json!({
+            "root": { "inputs": { "nixpkgs": "nixpkgs", "sub": "sub" } },
+            "nixpkgs": { "locked": { "type": "github", "owner": "nixos", "repo": "nixpkgs", "rev": "0" } },
+            "sub": { "locked": { "type": "path", "path": "./sub" }, "parent": [] },
+        }))
+        .is_ok());
+        for (locked, reason) in [
+            (
+                serde_json::json!({ "type": "path", "path": "/srv/data" }),
+                "absolute path",
+            ),
+            (
+                serde_json::json!({ "type": "path", "path": "../../etc" }),
+                "escapes its flake",
+            ),
+            (
+                serde_json::json!({ "type": "git", "url": "file:///srv/repo" }),
+                "local file URL",
+            ),
+            (
+                serde_json::json!({ "type": "tarball", "url": "FILE:/srv/a.tar" }),
+                "local file URL",
+            ),
+            (
+                serde_json::json!({ "type": "git", "url": "/srv/repo" }),
+                "local file URL",
+            ),
+        ] {
+            let error = lock(serde_json::json!({
+                "root": { "inputs": { "data": "data" } },
+                "data": { "locked": locked, "flake": false },
+            }))
+            .unwrap_err();
+            assert_eq!(error.category, ErrorCategory::InvalidRequest);
+            assert!(error.diagnostic.contains("`data`"), "{}", error.diagnostic);
+            assert!(error.diagnostic.contains(reason), "{}", error.diagnostic);
+        }
+        std::fs::write(dir.join("flake.lock"), "{ not json").unwrap();
+        assert!(refuse_local_locked_inputs(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evaluation_failures_name_the_node_setting_that_explains_them() {
+        assert!(
+            evaluation_hint("flake 'path:/x' requires lock file changes", false)
+                .contains("allow_unlocked_inputs")
+        );
+        assert!(
+            evaluation_hint("… while updating the lock file of flake 'path:/x'", true)
+                .contains("allow_unlocked_inputs")
+        );
+        assert!(
+            evaluation_hint("Operation not permitted (os error 1)", true)
+                .contains("unconfined_evaluation")
+        );
+        assert_eq!(
+            evaluation_hint("Operation not permitted (os error 1)", false),
+            ""
+        );
+    }
+
+    #[test]
     fn in_process_policy_enables_caller_evaluation_without_a_worker() {
         let dir = temporary("in-process-eval");
         let bundle = dir.join("bundle");
@@ -2243,10 +2603,12 @@ rmdir "{state}/lock"
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("flake.nix"), "{ outputs = _: { }; }").unwrap();
 
+        // The fake evaluator logs its argv next to itself, which a confined
+        // evaluator cannot write; confinement has its own test.
         let policy = dir.join("policy.json");
         std::fs::write(
             &policy,
-            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{}}"#,
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{},"unconfined_evaluation":true}"#,
         )
         .unwrap();
         std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2289,6 +2651,11 @@ rmdir "{state}/lock"
         assert!(arguments.contains("--print-out-paths"));
         assert!(!arguments.contains("--user"));
         assert!(arguments.contains(".imageless-source-"));
+        // A staged in-image flake evaluates against the lock it ships.
+        assert!(arguments.contains("--no-update-lock-file"));
+        // The build holds an indirect GC root until the bundle's exists.
+        assert!(arguments.contains("--out-link"));
+        assert!(!arguments.contains("--no-link"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2317,8 +2684,9 @@ rmdir "{state}/lock"
 
         // The same permissive policy, handed in inline rather than through a
         // file — no ownership check, and it authorizes exactly as the file did.
+        // Unconfined for the same reason as the file-policy test above.
         let inline = PolicySource::Inline(
-            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{}}"#
+            r#"{"system":"x86_64-linux","cache_only":false,"eval_allowed_uri_prefixes":["path:"],"issuers":{},"unconfined_evaluation":true}"#
                 .to_string(),
         );
         let success = resolve_in_process_at(
@@ -2359,6 +2727,8 @@ rmdir "{state}/lock"
             cache_only: false,
             eval_allowed_uri_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
             issuers: HashMap::new(),
+            unconfined_evaluation: true,
+            allow_unlocked_inputs: false,
         };
         config.evaluate_as_caller = true;
         if let Some((nix, nix_store)) = tools {
@@ -2366,6 +2736,53 @@ rmdir "{state}/lock"
             config.nix_store = nix_store.to_path_buf();
         }
         Resolver::new(config)
+    }
+
+    #[test]
+    fn a_follower_retries_a_retryable_failure_instead_of_inheriting_it() {
+        let dir = temporary("flight-retry");
+        let first = dir.join("first-call");
+        let eval_nix = dir.join("fake-eval-nix");
+        // The first evaluation fails (retryable: a Materialization error)
+        // after long enough for a second caller to join its flight; every
+        // later evaluation succeeds.
+        crate::testutil::executable(
+            &eval_nix,
+            &format!(
+                "if mkdir {first} 2>/dev/null; then sleep 1; echo transient >&2; exit 1; fi\n\
+                 printf '%s\\n' {STORE}",
+                first = first.display()
+            ),
+        );
+        std::env::set_var("FAKE_STORE", STORE);
+        let store_nix = fake_nix(&dir, "true");
+        let resolver =
+            evaluation_resolver(&["git+https://git.example/"], Some((&eval_nix, &store_nix)));
+        let installable = "git+https://git.example/app?rev=0123456789abcdef#rootfs";
+        let call = |label: &str| {
+            let bundle = dir.join(label);
+            std::fs::create_dir(&bundle).unwrap();
+            let resolver = resolver.clone();
+            std::thread::spawn(move || {
+                resolver.resolve_detailed(request(
+                    bundle,
+                    Materialize::Flake(installable.to_string()),
+                    10_000,
+                ))
+            })
+        };
+        let leader = call("leader");
+        std::thread::sleep(Duration::from_millis(300));
+        let follower = call("follower");
+        let leader = leader.join().unwrap();
+        let follower = follower.join().unwrap();
+        assert_eq!(leader.unwrap_err().category, ErrorCategory::Materialization);
+        let follower = follower.expect("the follower inherited the leader's failure");
+        assert_eq!(follower.resolution.rootfs, STORE);
+        // The roots point at a fake store path: look at the links themselves.
+        assert!(std::fs::symlink_metadata(dir.join("follower").join(GC_ROOT_NAME)).is_ok());
+        assert!(std::fs::symlink_metadata(dir.join("leader").join(GC_ROOT_NAME)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

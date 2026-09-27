@@ -76,6 +76,18 @@ pub fn plan(
 pub(crate) fn embedded_source_annotations(
     rootfs: &Path,
 ) -> io::Result<Option<HashMap<String, String>>> {
+    // A symlinked ancestor (`etc`, `etc/imageless`) would be resolved by the
+    // HOST kernel against the node's root, so the file it reaches is not in
+    // the image at all. Such an image carries no embedded flake at this path:
+    // pass it through rather than fail closed, since symlinking `/etc` is an
+    // ordinary thing for a non-imageless image to do.
+    let parent = Path::new(EMBEDDED_FLAKE_PATH)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or_default();
+    if first_symlinked_component(rootfs, parent)?.is_some() {
+        return Ok(None);
+    }
     let path = rootfs.join(EMBEDDED_FLAKE_PATH);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -326,6 +338,22 @@ pub fn expansion_request(
     }
     let materialize = plan(&annotations, &rootfs, default_output)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if let (Some(_), Some(relative)) = (
+        &materialize,
+        annotations
+            .get(SOURCE_ANNOTATION)
+            .and_then(|source| source.strip_prefix('/')),
+    ) {
+        if let Some(symlink) = first_symlinked_component(&rootfs, relative)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                ContractError::new(
+                    SOURCE_ANNOTATION,
+                    format!("in-image path traverses the symlink `/{symlink}`"),
+                ),
+            ));
+        }
+    }
     Ok(materialize.map(|materialize| ResolveRequest {
         version: PROTOCOL_VERSION,
         purpose: ResolvePurpose::Runtime,
@@ -334,6 +362,32 @@ pub fn expansion_request(
         timeout_ms: timeout_seconds.saturating_mul(1000),
         container_name: annotations.get(CRI_CONTAINER_NAME_ANNOTATION).cloned(),
     }))
+}
+
+/// The first component of in-image `relative` that is a symlink, if any.
+///
+/// In-image paths are read from the host before the container exists, so the
+/// host kernel resolves them: an image symlink `/a -> /` turns `/a/etc/nixos`
+/// into the node's own `/etc/nixos` (SPEC §2.3). Only the rootfs itself is
+/// trusted — the engine chose it — so every component below it is checked,
+/// the last one included. Nothing runs in the rootfs yet, so it cannot change
+/// between this walk and staging. A missing component ends the walk: whatever
+/// reads the path next reports it absent.
+fn first_symlinked_component(rootfs: &Path, relative: &str) -> io::Result<Option<String>> {
+    let mut path = rootfs.to_path_buf();
+    for component in relative.split('/').filter(|part| !part.is_empty()) {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let inside = path.strip_prefix(rootfs).unwrap_or(&path);
+                return Ok(Some(inside.display().to_string()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -545,6 +599,61 @@ mod tests {
             request.materialize,
             Materialize::Flake(format!("path:{}/etc/elsewhere#rootfs", rootfs.display()))
         );
+        std::fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn in_image_sources_never_traverse_a_symlink_onto_the_host() {
+        let bundle = temporary("symlinked-source");
+        let rootfs = bundle.join("rootfs");
+        let config = bundle.join("config.json");
+        let with_source = |source: &str| {
+            std::fs::write(
+                &config,
+                format!(
+                    r#"{{"root":{{"path":"rootfs"}},"annotations":{{"{SOURCE_ANNOTATION}":"{source}"}}}}"#
+                ),
+            )
+            .unwrap();
+            expansion_request(&config, &bundle, "rootfs", 30)
+        };
+        std::fs::create_dir_all(rootfs.join("srv/app")).unwrap();
+        std::os::unix::fs::symlink("/", rootfs.join("hostroot")).unwrap();
+        std::os::unix::fs::symlink("srv/app", rootfs.join("app")).unwrap();
+
+        // The reproduced exploit: `/hostroot -> /` would stage the node's own
+        // directory. Refused, and the diagnostic names the offending link.
+        let error = with_source("/hostroot/etc").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("`/hostroot`"), "{error}");
+        // A symlink in last position, even a relative in-image one, is refused
+        // here too rather than left to staging.
+        assert!(with_source("/app").is_err());
+        // A real directory path is unaffected, and a missing one is left for
+        // staging to report.
+        assert_eq!(
+            with_source("/srv/app").unwrap().unwrap().materialize,
+            Materialize::Flake(format!("path:{}/srv/app#rootfs", rootfs.display()))
+        );
+        assert!(with_source("/srv/missing/deeper").unwrap().is_some());
+
+        // Zero-config discovery through a symlinked ancestor would stat a HOST
+        // file; such an image has no embedded flake and passes through.
+        std::fs::write(&config, br#"{"root":{"path":"rootfs"},"annotations":{}}"#).unwrap();
+        let host_etc = bundle.join("host-etc");
+        std::fs::create_dir_all(host_etc.join("imageless")).unwrap();
+        std::fs::write(host_etc.join("imageless/flake.nix"), "{ }").unwrap();
+        std::os::unix::fs::symlink(&host_etc, rootfs.join("etc")).unwrap();
+        assert!(expansion_request(&config, &bundle, "rootfs", 30)
+            .unwrap()
+            .is_none());
+        std::fs::remove_file(rootfs.join("etc")).unwrap();
+        std::fs::create_dir(rootfs.join("etc")).unwrap();
+        std::os::unix::fs::symlink(host_etc.join("imageless"), rootfs.join("etc/imageless"))
+            .unwrap();
+        assert!(expansion_request(&config, &bundle, "rootfs", 30)
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(bundle).unwrap();
     }
 

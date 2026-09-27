@@ -56,7 +56,27 @@ pub(crate) fn validate_realise_output(
 }
 
 pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Result<String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    run_command_confined(command, timeout, None)
+}
+
+/// [`run_command`], with the command's process first entering `confinement`.
+///
+/// Hook order is the point: the process-group and parent-death setup runs
+/// first, in the process `spawn` returns, so the evaluator that
+/// [`Confinement::enter`] forks inherits that group — and the timeout's group
+/// kill reaches it — instead of making a group of its own nobody kills.
+pub(crate) fn run_command_confined(
+    command: &mut Command,
+    timeout: Duration,
+    confinement: Option<crate::confine::Confinement>,
+) -> io::Result<String> {
+    // Under `runc create` our stdin is the container's stdio: a Nix client,
+    // fetcher, or credential prompt must never read bytes meant for the
+    // workload, nor hold its pipe open after we return.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -70,6 +90,11 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
             }
             Ok(())
         });
+        if let Some(confinement) = confinement {
+            // SAFETY: `enter` performs raw syscalls on data prepared before
+            // the fork and allocates nothing.
+            command.pre_exec(move || confinement.enter());
+        }
     }
     let mut child = command.spawn()?;
     let stdout = child
@@ -91,13 +116,13 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
             kill_process_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            let _ = join_capture(stdout_reader);
+            drop(stdout_reader);
             // What Nix last said is the only evidence of where a create that
             // ran out of deadline actually got to — for `--realise`, the path
             // substitution was working on. It was already in memory and
             // discarded here, which made a wedge on the first path and a copy
             // of the six-hundredth produce the same sentence.
-            let excerpt = join_capture(stderr_reader)
+            let excerpt = join_capture_within(stderr_reader, KILL_GRACE)
                 .map(|stderr| diagnostic_excerpt(&stderr.bytes))
                 .unwrap_or_default();
             return Err(io::Error::new(
@@ -114,8 +139,8 @@ pub(crate) fn run_command(command: &mut Command, timeout: Duration) -> io::Resul
     while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
         if started.elapsed() >= timeout {
             kill_process_group(child.id());
-            let _ = join_capture(stdout_reader);
-            let excerpt = join_capture(stderr_reader)
+            drop(stdout_reader);
+            let excerpt = join_capture_within(stderr_reader, KILL_GRACE)
                 .map(|stderr| diagnostic_excerpt(&stderr.bytes))
                 .unwrap_or_default();
             return Err(io::Error::new(
@@ -240,6 +265,29 @@ fn capture_output(mut pipe: impl Read, retention: Retention) -> io::Result<Captu
         truncated = true;
     }
     Ok(CapturedOutput { bytes, truncated })
+}
+
+/// How long a timed-out command's output readers get to finish after the
+/// kill. The kill reaches the process group; a helper that left it (setsid,
+/// a daemonized fetcher) can hold the pipes open indefinitely, and joining
+/// its reader unconditionally made the deadline unbounded.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Join a reader if it finishes within `grace`; otherwise leave it detached —
+/// it ends when the last holder of the pipe does — and report nothing, so
+/// the caller's deadline holds.
+fn join_capture_within(
+    handle: thread::JoinHandle<io::Result<CapturedOutput>>,
+    grace: Duration,
+) -> Option<CapturedOutput> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= grace {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    join_capture(handle).ok()
 }
 
 fn join_capture(
@@ -378,6 +426,24 @@ mod tests {
             root,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_helper_that_escapes_the_process_group_cannot_stretch_the_deadline() {
+        // setsid puts the sleeper in its own session, out of reach of the
+        // group kill, still holding the inherited stdout/stderr.
+        let started = Instant::now();
+        let error = run_command(
+            Command::new("sh").args(["-c", "setsid sleep 30 & sleep 30"]),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "deadline stretched to {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

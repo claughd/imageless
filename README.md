@@ -134,7 +134,9 @@ node enforces (so a refusal happens at authoring time, with the offending path
 in hand), pushes it to `registry.example/team/app` by digest, prints the
 layer/config/manifest digests on stderr, and writes a digest-pinned pod
 manifest on stdout — everything but the pod manifest stays out of stdout's
-way. `--dry-run` stops before the push and needs no network. Credentials come
+way. `--dry-run` stops before the push and needs no network. The node
+materializes the root read-only, so `--writable PATH` (repeatable) gives the
+pod an emptyDir at each path the workload writes, such as `/tmp`. Credentials come
 from `docker login` (config.json `auths` and credential helpers; Basic and
 Bearer auth). Loopback registries like kind's `localhost:5001` are plain HTTP
 automatically; everything else is HTTPS unless you pass `--plain-http`. Some

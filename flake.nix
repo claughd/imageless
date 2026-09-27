@@ -802,9 +802,9 @@
               daemon.systemd.services.imageless-resolver.serviceConfig.ExecStart;
             assert daemon.users.users ? imageless-dev;
             pkgs.writeText "imageless-module-eval" "ok";
-          # dev/kind is executable documentation; lint what can drift: the
-          # setup script, the manifests, and the containerd patch, which must
-          # stay identical to the runtime table of
+          # dev/kind and dev/k3s are executable documentation; lint what can
+          # drift: the setup scripts, the manifests, and the containerd patch
+          # and drop-in, which must stay identical to the runtime table of
           # examples/containerd-config.toml.
           quickstart-lint =
             let
@@ -815,12 +815,17 @@
                 nativeBuildInputs = [ pkgs.shellcheck pkgs.yq-go pkgs.python3 ];
                 quickstart = lib.fileset.toSource {
                   root = ./.;
-                  fileset = lib.fileset.unions [ ./dev/kind ./examples/containerd-config.toml ];
+                  fileset = lib.fileset.unions [
+                    ./dev/kind
+                    ./dev/k3s
+                    ./examples/containerd-config.toml
+                  ];
                 };
                 expectedImage = "${image.imageName}:${image.imageTag}";
               }
               ''
-                shellcheck "$quickstart/dev/kind/setup.sh"
+                shellcheck "$quickstart/dev/kind/setup.sh" "$quickstart/dev/k3s/setup.sh"
+                yq eval '.' "$quickstart/dev/k3s/registries.yaml" >/dev/null
                 yq eval '.' "$quickstart/dev/kind/kind-config.yaml" >/dev/null
                 yq eval '.' "$quickstart/dev/kind/pod-nginx-embedded.yaml" >/dev/null
                 test "$(yq eval '.spec.containers[0].image' "$quickstart/dev/kind/pod-nginx-embedded.yaml")" \
@@ -875,6 +880,24 @@
                     "a production node is systemd-managed: "
                     "examples/containerd-config.toml must set SystemdCgroup = true"
                 )
+                dropin, dropin_driver = driver(
+                    runtime(
+                        tomllib.loads(
+                            (source / "dev/k3s/containerd/imageless.toml").read_text()
+                        )
+                    ),
+                    "dev/k3s/containerd/imageless.toml",
+                )
+                assert dropin == example, (
+                    "dev/k3s drop-in drifted from examples/containerd-config.toml"
+                )
+                # The oom drop-in must only ever carry the one setting it is for.
+                oom = tomllib.loads(
+                    (source / "dev/k3s/containerd/restrict-oom.toml").read_text()
+                )
+                assert oom["plugins"] == {
+                    "io.containerd.cri.v1.runtime": {"restrict_oom_score_adj": True}
+                }, "dev/k3s/containerd/restrict-oom.toml carries more than the clamp"
                 PY
                 touch $out
               '';

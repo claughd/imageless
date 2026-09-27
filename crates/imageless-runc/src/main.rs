@@ -50,8 +50,36 @@ fn default_output() -> String {
 /// `--flag value` (the `--flag=value` form carries its own value). Every other
 /// pre-subcommand token starting with `-` is a boolean switch (`--debug`,
 /// `--systemd-cgroup`, ...). This table exists only to walk past the global
-/// prefix and land on the subcommand token.
-const GLOBAL_VALUE_FLAGS: &[&str] = &["--root", "--log", "--log-format", "--criu", "--rootless"];
+/// prefix and land on the subcommand token. Names are bare: see [`flag`].
+const GLOBAL_VALUE_FLAGS: &[&str] = &["root", "log", "log-format", "criu", "rootless"];
+
+/// The subcommands that build a container from a bundle's config.json, and so
+/// must see the materialized root: `run` is create + start, and `restore`
+/// creates the container a checkpoint is restored into.
+const BUNDLE_SUBCOMMANDS: &[&str] = &["create", "run", "restore"];
+
+/// runc parses flags with urfave/cli v1 over Go's `flag` package, which takes
+/// `-name` and `--name` alike, each as `name value` or `name=value`. Split a
+/// token into its bare name and inline value; `None` for a non-flag or `--`.
+fn flag(argument: &str) -> Option<(&str, Option<&str>)> {
+    let body = argument
+        .strip_prefix("--")
+        .or_else(|| argument.strip_prefix('-'))
+        .filter(|body| !body.is_empty() && !body.starts_with('-'))?;
+    Some(match body.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (body, None),
+    })
+}
+
+/// Tokens a flag occupies: its own, plus the next when it takes a value and
+/// did not carry one inline.
+fn flag_width(argument: &str, value_flags: &[&str]) -> usize {
+    match flag(argument) {
+        Some((name, None)) if value_flags.contains(&name) => 2,
+        _ => 1,
+    }
+}
 
 /// Index of the runc subcommand: the first argv element that is neither a
 /// global flag nor the value of one. Searching argv for the literal string
@@ -68,11 +96,7 @@ fn subcommand_index(arguments: &[String]) -> Option<usize> {
         if !argument.starts_with('-') {
             return Some(index);
         }
-        index += if GLOBAL_VALUE_FLAGS.contains(&argument) {
-            2
-        } else {
-            1
-        };
+        index += flag_width(argument, GLOBAL_VALUE_FLAGS);
     }
     None
 }
@@ -81,25 +105,19 @@ fn subcommand_index(arguments: &[String]) -> Option<usize> {
 /// spelling runc accepts. The search stops at the subcommand so that a
 /// `create --log-format ...` never answers for the global one, and so that a
 /// container ID that happens to spell a flag is never read as one.
-fn global_flag<'a>(arguments: &'a [String], flag: &str) -> Option<&'a str> {
+fn global_flag<'a>(arguments: &'a [String], wanted: &str) -> Option<&'a str> {
     let end = subcommand_index(arguments).unwrap_or(arguments.len());
     let mut index = 0;
     while index < end {
         let argument = arguments[index].as_str();
-        if argument == flag {
-            return arguments.get(index + 1).map(String::as_str);
+        match flag(argument) {
+            Some((name, Some(value))) if name == wanted => return Some(value),
+            Some((name, None)) if name == wanted => {
+                return arguments.get(index + 1).map(String::as_str)
+            }
+            _ => {}
         }
-        if let Some(value) = argument
-            .strip_prefix(flag)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            return Some(value);
-        }
-        index += if GLOBAL_VALUE_FLAGS.contains(&argument) {
-            2
-        } else {
-            1
-        };
+        index += flag_width(argument, GLOBAL_VALUE_FLAGS);
     }
     None
 }
@@ -113,10 +131,10 @@ fn global_flag<'a>(arguments: &'a [String], flag: &str) -> Option<&'a str> {
 /// would corrupt the operator's file to no one's benefit, so the absent format
 /// flag means silence rather than a guess.
 fn runtime_log(arguments: &[String]) -> Option<PathBuf> {
-    if global_flag(arguments, "--log-format") != Some("json") {
+    if global_flag(arguments, "log-format") != Some("json") {
         return None;
     }
-    global_flag(arguments, "--log")
+    global_flag(arguments, "log")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
 }
@@ -125,30 +143,61 @@ fn create_bundle(arguments: &[String]) -> Result<Option<PathBuf>, String> {
     let Some(create_index) = subcommand_index(arguments) else {
         return Ok(None);
     };
-    if arguments[create_index] != "create" {
+    if !BUNDLE_SUBCOMMANDS.contains(&arguments[create_index].as_str()) {
         return Ok(None);
     }
     let command_arguments = &arguments[create_index + 1..];
     for (index, argument) in command_arguments.iter().enumerate() {
-        if argument == "--bundle" || argument == "-b" {
-            return command_arguments
-                .get(index + 1)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .map(Some)
-                .ok_or_else(|| format!("{argument} requires a path"));
+        if argument == "--" {
+            break;
         }
-        if let Some(value) = argument
-            .strip_prefix("--bundle=")
-            .or_else(|| argument.strip_prefix("-b="))
-        {
-            if value.is_empty() {
-                return Err(format!("{argument} requires a path"));
+        match flag(argument) {
+            Some(("bundle" | "b", None)) => {
+                return command_arguments
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(Some)
+                    .ok_or_else(|| format!("{argument} requires a path"));
             }
-            return Ok(Some(PathBuf::from(value)));
+            Some(("bundle" | "b", Some(value))) => {
+                if value.is_empty() {
+                    return Err(format!("{argument} requires a path"));
+                }
+                return Ok(Some(PathBuf::from(value)));
+            }
+            _ => {}
         }
     }
     Ok(Some(PathBuf::from(".")))
+}
+
+/// Put back the config.json the engine wrote, so a create retried on the same
+/// bundle plans against the image again instead of against our rewrite (whose
+/// /nix/store mount would collide with the one the retry adds). Temp + rename
+/// in the bundle directory, mode preserved: never a half-written spec.
+fn restore_config(config: &Path, original: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let permissions = std::fs::metadata(config)?.permissions();
+    let temporary = config.with_file_name(format!(
+        ".config.json.imageless-restore-{}",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let written = file
+        .write_all(original)
+        .and_then(|()| file.set_permissions(permissions))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temporary, config));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 fn canonical_bundle(arguments: &[String]) -> Result<Option<PathBuf>, String> {
@@ -189,6 +238,7 @@ fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let bundle = canonical_bundle(&arguments).unwrap_or_else(|error| fail(error, 1));
     let mut applied = None;
+    let mut original_config = None;
 
     if let Some(bundle) = &bundle {
         let mut prepare = PrepareBundle::new(bundle.join("config.json"), bundle);
@@ -198,6 +248,9 @@ fn main() {
         // contract with the runtime that invoked it, and the library serves
         // embedders that have no argv at all.
         prepare.runtime_log = runtime_log(&arguments);
+        // Read before preparation so a failed delegate can be undone; a bundle
+        // without a readable config fails in preparation with its own error.
+        original_config = std::fs::read(bundle.join("config.json")).ok();
         let prepare_started = Instant::now();
         let resolution = prepare_bundle(&prepare).unwrap_or_else(|error| {
             // The sink recorded successes only: every failure exited here,
@@ -256,7 +309,7 @@ fn main() {
         Err(error) => {
             if let Some(bundle) = &bundle {
                 if applied.is_some() {
-                    let _ = remove_bundle_gc_roots(bundle);
+                    undo(bundle, original_config.as_deref());
                 }
             }
             fail(format_args!("execute {delegate}: {error}"), 127)
@@ -270,14 +323,29 @@ fn main() {
             Some(if status.success() { "success" } else { "error" }),
         );
     }
+    // `run` without --detach returns when the container exits, and its status
+    // is the workload's: the container is gone either way, so the undo holds.
     if !status.success() {
         if let Some(bundle) = &bundle {
             if applied.is_some() {
-                let _ = remove_bundle_gc_roots(bundle);
+                undo(bundle, original_config.as_deref());
             }
         }
     }
     exit_like(status);
+}
+
+/// Reverse a preparation the delegate never turned into a container: release
+/// its GC roots and restore the engine's config.json.
+fn undo(bundle: &Path, original_config: Option<&[u8]>) {
+    let _ = remove_bundle_gc_roots(bundle);
+    if let Some(original) = original_config {
+        if let Err(error) = restore_config(&bundle.join("config.json"), original) {
+            eprintln!(
+                "imageless-runc: could not restore config.json after a failed create: {error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +462,14 @@ mod tests {
     #[test]
     fn only_create_selects_a_bundle() {
         assert_eq!(create_bundle(&args(&["start", "id"])).unwrap(), None);
+        // `run` and `restore` build a container from the bundle just as
+        // `create` does; passing them through would start the seed unbuilt.
+        for subcommand in ["run", "restore"] {
+            assert_eq!(
+                create_bundle(&args(&[subcommand, "-b", "/bundle", "id"])).unwrap(),
+                Some(PathBuf::from("/bundle"))
+            );
+        }
         assert_eq!(
             create_bundle(&args(&["--root", "/run/runc", "create", "id"])).unwrap(),
             Some(PathBuf::from("."))
@@ -407,6 +483,10 @@ mod tests {
             args(&["create", "-b", "/bundle", "id"]),
             args(&["create", "--bundle=/bundle", "id"]),
             args(&["create", "-b=/bundle", "id"]),
+            // Go's flag package: one dash or two, for either name.
+            args(&["create", "-bundle", "/bundle", "id"]),
+            args(&["create", "--b", "/bundle", "id"]),
+            args(&["create", "-bundle=/bundle", "id"]),
         ] {
             assert_eq!(
                 create_bundle(&arguments).unwrap(),
@@ -457,6 +537,19 @@ mod tests {
                 "--log", "/tmp/log", "--debug", "create", "-b", "/bundle", "id",
             ]),
             args(&["--rootless", "true", "create", "-b", "/bundle", "id"]),
+            // Single-dash globals: `-root /r` must consume its value, or `/r`
+            // reads as the subcommand and the create passes through unbuilt.
+            args(&["-root", "/r", "create", "-b", "/bundle", "id"]),
+            args(&[
+                "-log",
+                "/l",
+                "-log-format",
+                "json",
+                "create",
+                "-b",
+                "/bundle",
+                "id",
+            ]),
         ] {
             assert_eq!(
                 create_bundle(&arguments).unwrap(),
@@ -467,6 +560,48 @@ mod tests {
         assert_eq!(create_bundle(&args(&["--version"])).unwrap(), None);
         assert_eq!(create_bundle(&args(&[])).unwrap(), None);
         assert_eq!(create_bundle(&args(&["--root"])).unwrap(), None);
+    }
+
+    #[test]
+    fn single_dash_globals_answer_for_the_runtime_log() {
+        assert_eq!(
+            runtime_log(&args(&[
+                "-log",
+                "/run/log.json",
+                "-log-format=json",
+                "create",
+                "id"
+            ])),
+            Some(PathBuf::from("/run/log.json"))
+        );
+    }
+
+    #[test]
+    fn a_bundle_flag_after_the_argument_terminator_is_an_argument() {
+        assert_eq!(
+            create_bundle(&args(&["create", "--", "-b", "/not-a-flag"])).unwrap(),
+            Some(PathBuf::from("."))
+        );
+    }
+
+    #[test]
+    fn a_failed_create_puts_the_engine_config_back_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("il-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, "rewritten").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        super::restore_config(&config, b"original").unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), b"original");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        // Nothing but the config is left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

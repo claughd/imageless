@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const STORE_PATH: &str = "/nix/store/00000000000000000000000000000000-rootfs";
 const STORE_MOUNT_PATH: &str = "/nix/store/11111111111111111111111111111111-tools";
@@ -113,6 +113,10 @@ impl TestRelease {
             "cache_only": false,
             "eval_allowed_uri_prefixes": ["path:"],
             "issuers": {},
+            // The fake Nix reports what it observed into this test's temp
+            // directory, which a confined evaluator cannot write. Confinement
+            // is exercised by the library's own test and the acceptance gates.
+            "unconfined_evaluation": true,
         });
         let path = dir.join("development-policy.json");
         std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -123,16 +127,17 @@ impl TestRelease {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
+    // The resolver binds `resolver.sock` in here, and sun_path holds 108 bytes.
+    // Outside the Nix sandbox (whose TMPDIR is a short /build) the temp dir is
+    // itself ~40 bytes, so the name stays compact: pid + counter is unique
+    // within a run, and a stale directory from a recycled pid is cleared.
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "imageless-cli-{label}-{}-{timestamp}-{}",
+        "il-{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }
@@ -352,7 +357,9 @@ fn development_source_uses_the_sanitized_unprivileged_worker() {
         &nix,
         &format!(
             r#"
-if [ -z "$root" ]; then
+# The evaluation is the `build` call; root registration is `--realise`.
+# Both name a root now: the build holds an --out-link while it runs.
+case " $* " in *" build "*)
   test -z "${{LEAK_SECRET+x}}"
   while read -r key real effective saved filesystem; do
     if [ "$key" = "Uid:" ]; then
@@ -362,7 +369,8 @@ if [ -z "$root" ]; then
   done < /proc/self/status
   printf '%s\n' "{}"
   exit 0
-fi
+  ;;
+esac
 "#,
             worker_uid.display(),
             STORE_PATH
@@ -808,13 +816,24 @@ fn delegate_or_rewrite_failure_removes_new_root() {
 
     let delegated = dir.join("delegated");
     std::fs::create_dir(&delegated).unwrap();
-    write_config(&delegated, release.annotations());
+    let config = write_config(&delegated, release.annotations());
+    let engine_config = std::fs::read(&config).unwrap();
     let output = runc(&delegated, &failing_delegate, &resolver.socket)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(42));
     assert!(!delegated.join(imageless::GC_ROOT_NAME).exists());
     assert!(!delegated.join(imageless::GC_ROOTS_DIR_NAME).exists());
+    // The engine's config is back, byte for byte, so a create retried on the
+    // same bundle plans against the image, not against our rewrite.
+    assert_eq!(std::fs::read(&config).unwrap(), engine_config);
+    let succeeding_delegate = dir.join("delegate-ok");
+    executable(&succeeding_delegate, "exit 0");
+    let retried = runc(&delegated, &succeeding_delegate, &resolver.socket)
+        .output()
+        .unwrap();
+    assert_success(&retried);
+    assert_eq!(root_path(&config), STORE_PATH);
 
     let rewrite = dir.join("rewrite");
     std::fs::create_dir(&rewrite).unwrap();

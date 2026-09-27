@@ -11,6 +11,7 @@
 
 mod bundle;
 mod client;
+mod confine;
 mod gc;
 mod materialize;
 mod mounts;
@@ -28,6 +29,8 @@ pub use client::{
     effective_uid, peer_allowed, peer_uid, read_frame, request_inspection,
     request_resolution_detailed, write_frame,
 };
+#[cfg(feature = "daemon")]
+pub use confine::Confinement;
 pub use gc::{remove_bundle_gc_roots, remove_gc_root};
 pub use materialize::{
     ClosurePathReport, ClosureReport, ContractError, ErrorCategory, Materialize, ResolutionError,
@@ -209,6 +212,8 @@ printf '%s\n' "$store_path"
                 cache_only: false,
                 eval_allowed_uri_prefixes: vec!["path:".to_string()],
                 issuers: HashMap::new(),
+                unconfined_evaluation: true,
+                allow_unlocked_inputs: false,
             },
             development_worker: None,
             evaluate_as_caller: false,

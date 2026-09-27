@@ -140,8 +140,11 @@ pub fn policy_prefix(reference: &str) -> String {
     };
     match locator[path_starts..].rfind('/') {
         Some(slash) => locator[..=path_starts + slash].to_string(),
-        // No path separator, so there is no boundary to cut at and the whole
-        // locator is the narrowest honest suggestion.
+        // No path separator to cut at. A query is the next boundary: the node
+        // compares against the reference with its query, so `host?` admits
+        // `host?rev=…` and not `host.evil`. With no query either, the whole
+        // reference is the narrowest prefix there is.
+        None if locator.len() < reference.len() => format!("{locator}?"),
         None => locator.to_string(),
     }
 }
@@ -290,6 +293,10 @@ mod tests {
             "tarball+http://127.0.0.1:8081/"
         );
         assert_eq!(policy_prefix("https://host"), "https://host");
+        // Terminated at the query, so a longer host name is not admitted.
+        let prefix = policy_prefix(&format!("git+https://example.com?rev={REV}"));
+        assert_eq!(prefix, "git+https://example.com?");
+        assert!(!"git+https://example.com.evil/x".starts_with(&prefix));
     }
 
     #[test]

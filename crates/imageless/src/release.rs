@@ -487,6 +487,18 @@ pub struct ResolverPolicy {
     pub eval_allowed_uri_prefixes: Vec<String>,
     #[serde(default)]
     pub issuers: HashMap<String, IssuerPolicy>,
+    // Node-side evaluation runs in a private mount namespace that exposes only
+    // the store, system trees, and the staged source (SPEC §2.3), so no flake
+    // input — direct or transitive — can read the node's filesystem. Set true
+    // only on a node that cannot create mount namespaces; the default, like
+    // every other field here, is the safe one.
+    #[serde(default)]
+    pub unconfined_evaluation: bool,
+    // An in-image flake with inputs must ship a complete flake.lock. Set true
+    // to let the node lock such a seed's inputs at evaluation time instead —
+    // non-reproducible, and meant for development nodes.
+    #[serde(default)]
+    pub allow_unlocked_inputs: bool,
 }
 
 fn default_cache_only() -> bool {
