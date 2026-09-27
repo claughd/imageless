@@ -91,12 +91,18 @@ embedded flake there and passes through.
 Staging bounds what the installable names; it cannot bound what the flake's own
 inputs name, and Nix fetches inputs — direct or transitive, `path:` and
 `file://` among them — from whatever filesystem the evaluator can see. The
-reference materializer therefore evaluates in a private mount namespace whose
-root holds only the store, the system program and library trees, the `/etc`
-entries Nix needs (its configuration, TLS roots, name resolution, account
-lookup), `/dev`, `/proc`, a private `/tmp`, the staged source, and the
-evaluator's fetcher cache. A node-local input resolves against that root and
-reaches nothing of the node's. A node that cannot create mount namespaces must
+reference materializer therefore evaluates in private mount and PID
+namespaces. The root holds only the store, the system program and library
+trees, and the `/etc` entries Nix needs (its configuration, TLS roots, name
+resolution, account lookup). It also holds the character devices Nix opens
+(`null`, `zero`, `full`, `random`, `urandom`, `tty`), a private devpts
+instance, a procfs mounted from inside the new PID namespace, a private
+`/tmp`, the staged source, and the evaluator's fetcher and pending-root
+scratch. The host's `/proc` and `/dev` are never exposed. In the host PID
+namespace, `/proc/<pid>/root` would lead back to the node's filesystem. A
+node-local input resolves against that root and reaches nothing of the
+node's. The evaluator is PID 1 of its namespace, so nothing it spawns outlives
+it. A node that cannot create mount namespaces must
 say so in its policy (`unconfined_evaluation: true`); the default fails the
 create instead. TLS roots outside the allowlist must be named through
 `NIX_SSL_CERT_FILE`, which the evaluator binds.

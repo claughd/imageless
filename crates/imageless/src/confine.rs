@@ -8,7 +8,7 @@
 //! the evaluator runs in a private mount namespace whose root is a fresh tmpfs
 //! holding only an allowlist — `/nix`, the system's program and library trees,
 //! the handful of `/etc` entries Nix needs (its config, TLS roots, name
-//! resolution, account lookup), `/dev`, `/proc`, a private `/tmp`, and the
+//! resolution, account lookup), a few device nodes, a private `/proc` and `/tmp`, and the
 //! caller's own paths (the staged source, a cache directory, a TLS bundle).
 //! A local input anywhere in the graph resolves against that root and finds
 //! nothing of the node's.
@@ -48,17 +48,47 @@ const SYSTEM_READ_ONLY: &[&str] = &[
 ];
 
 /// Writable because Nix writes there: the store and its database (when this
-/// process owns the store rather than a daemon), and device nodes.
-const SYSTEM_WRITABLE: &[&str] = &["/nix", "/dev"];
+/// process owns the store rather than a daemon).
+const SYSTEM_WRITABLE: &[&str] = &["/nix"];
+
+/// The device nodes Nix and its sandbox setup open, bound one by one. Never
+/// the host's whole `/dev`: that would hand a root evaluator raw disks,
+/// `/dev/mem` and the kernel log.
+const DEVICES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+];
+
+/// How a bind is remounted once it is in place.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Access {
+    /// Read-only, no setuid, no device nodes.
+    ReadOnly,
+    /// Writable, but still no setuid and no device nodes.
+    Writable,
+    /// A single device node: writable and openable, never setuid.
+    Device,
+}
 
 enum Step {
     Tmpfs(CString),
+    /// A private devpts instance: Nix allocates a pseudoterminal for every
+    /// local build, and the host's ptys stay out of reach.
+    Devpts(CString),
+    Symlink {
+        target: CString,
+        link: CString,
+    },
     Mkdir(CString),
     Touch(CString),
     Bind {
         source: CString,
         target: CString,
-        read_only: bool,
+        access: Access,
     },
 }
 
@@ -92,17 +122,31 @@ impl Confinement {
         plan.directory(Path::new("/tmp"))?;
         plan.steps.push(Step::Tmpfs(c_path(&root.join("tmp"))?));
         for path in SYSTEM_WRITABLE {
-            plan.bind(Path::new(path), false)?;
+            plan.bind(Path::new(path), Access::Writable)?;
         }
-        plan.bind(Path::new("/proc"), true)?;
+        for path in DEVICES {
+            plan.bind(Path::new(path), Access::Device)?;
+        }
+        plan.directory(Path::new("/dev/pts"))?;
+        plan.steps
+            .push(Step::Devpts(c_path(&root.join("dev/pts"))?));
+        plan.steps.push(Step::Symlink {
+            target: c_path(Path::new("pts/ptmx"))?,
+            link: c_path(&root.join("dev/ptmx"))?,
+        });
+        // Never the host's /proc: in the host PID namespace its
+        // /proc/<pid>/root links resolve against other processes' mount
+        // namespaces — straight back to the host filesystem. `enter` mounts a
+        // fresh procfs from inside a private PID namespace instead.
+        plan.directory(Path::new("/proc"))?;
         for path in SYSTEM_READ_ONLY {
-            plan.bind(Path::new(path), true)?;
+            plan.bind(Path::new(path), Access::ReadOnly)?;
         }
         for path in writable {
-            plan.bind(path, false)?;
+            plan.bind(path, Access::Writable)?;
         }
         for path in read_only {
-            plan.bind(path, true)?;
+            plan.bind(path, Access::ReadOnly)?;
         }
         Ok(Self {
             root: c_path(root)?,
@@ -131,11 +175,19 @@ impl Confinement {
         Self::prepare(root, writable, &read_only)
     }
 
-    /// Enter the confinement: unshare the mount namespace, build the root, and
-    /// pivot into it. Syscalls only — safe between `fork` and `exec`.
+    /// Enter the confinement: unshare the mount and PID namespaces, build the
+    /// root, pivot into it, and fork. Syscalls only — safe between `fork` and
+    /// `exec`.
+    ///
+    /// Only the forked child returns: it is PID 1 of the new PID namespace,
+    /// with a procfs that shows that namespace alone. The calling process
+    /// stays behind to wait for it and exits with its status (128 + signal for
+    /// a signaled child), so a caller that spawned this process sees the
+    /// evaluator's outcome as its own. When the child exits the kernel kills
+    /// everything left in its namespace, so no helper outlives it.
     pub fn enter(&self) -> io::Result<()> {
         unsafe {
-            check(libc::unshare(libc::CLONE_NEWNS))?;
+            check(libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID))?;
             // Nothing below may propagate back to the host's mount table.
             check(libc::mount(
                 std::ptr::null(),
@@ -153,6 +205,16 @@ impl Confinement {
                         libc::MS_NOSUID | libc::MS_NODEV,
                         c"mode=0755".as_ptr().cast(),
                     ))?,
+                    Step::Devpts(target) => check(libc::mount(
+                        c"devpts".as_ptr(),
+                        target.as_ptr(),
+                        c"devpts".as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NOEXEC,
+                        c"newinstance,ptmxmode=0666,mode=0620".as_ptr().cast(),
+                    ))?,
+                    Step::Symlink { target, link } => {
+                        check(libc::symlink(target.as_ptr(), link.as_ptr()))?
+                    }
                     Step::Mkdir(path) => {
                         if libc::mkdir(path.as_ptr(), 0o755) == -1
                             && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
@@ -172,7 +234,7 @@ impl Confinement {
                     Step::Bind {
                         source,
                         target,
-                        read_only,
+                        access,
                     } => {
                         check(libc::mount(
                             source.as_ptr(),
@@ -181,19 +243,18 @@ impl Confinement {
                             libc::MS_BIND | libc::MS_REC,
                             std::ptr::null(),
                         ))?;
-                        if *read_only {
-                            check(libc::mount(
-                                std::ptr::null(),
-                                target.as_ptr(),
-                                std::ptr::null(),
-                                libc::MS_BIND
-                                    | libc::MS_REMOUNT
-                                    | libc::MS_RDONLY
-                                    | libc::MS_NOSUID
-                                    | libc::MS_NODEV,
-                                std::ptr::null(),
-                            ))?;
-                        }
+                        let flags = match access {
+                            Access::ReadOnly => libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                            Access::Writable => libc::MS_NOSUID | libc::MS_NODEV,
+                            Access::Device => libc::MS_NOSUID,
+                        };
+                        check(libc::mount(
+                            std::ptr::null(),
+                            target.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_REMOUNT | flags,
+                            std::ptr::null(),
+                        ))?;
                     }
                 }
             }
@@ -201,9 +262,56 @@ impl Confinement {
             check(libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) as i32)?;
             check(libc::umount2(c".".as_ptr(), libc::MNT_DETACH))?;
             check(libc::chdir(c"/".as_ptr()))?;
+
+            // The first child forked after unsharing a PID namespace is its
+            // PID 1; this process itself stays in the old one.
+            let child = libc::fork();
+            check(child)?;
+            if child > 0 {
+                wait_and_mirror(child);
+            }
+            // PID 1 of the new namespace: this procfs lists its own
+            // processes, so /proc/<pid>/root never leaves the confined root.
+            check(libc::mount(
+                c"proc".as_ptr(),
+                c"/proc".as_ptr(),
+                c"proc".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                std::ptr::null(),
+            ))?;
         }
         Ok(())
     }
+}
+
+/// The parent side of [`Confinement::enter`]'s fork: never returns.
+///
+/// It drops every descriptor above stderr first. Whoever spawned this process
+/// may be waiting for EOF on a pipe only `exec` closes (Rust's spawn reports
+/// exec failures that way); this side never execs, so holding its copy would
+/// stall that caller for the evaluator's whole lifetime. It dies with its own
+/// parent, and the evaluator — PID 1 of the namespace — dies with it through
+/// the parent-death signal the spawner installs after this returns in the
+/// child, taking the namespace with it.
+unsafe fn wait_and_mirror(child: libc::pid_t) -> ! {
+    libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    let mut status = 0;
+    loop {
+        if libc::waitpid(child, &mut status, 0) == child {
+            break;
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            libc::_exit(1);
+        }
+    }
+    if libc::WIFEXITED(status) {
+        libc::_exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        libc::_exit(128 + libc::WTERMSIG(status));
+    }
+    libc::_exit(1)
 }
 
 struct Plan {
@@ -214,7 +322,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn bind(&mut self, source: &Path, read_only: bool) -> io::Result<()> {
+    fn bind(&mut self, source: &Path, access: Access) -> io::Result<()> {
         if !source.is_absolute()
             || source
                 .components()
@@ -247,7 +355,7 @@ impl Plan {
         self.steps.push(Step::Bind {
             source: c_path(source)?,
             target: c_path(&target)?,
-            read_only,
+            access,
         });
         self.bound.push(source.to_path_buf());
         Ok(())
@@ -357,12 +465,18 @@ mod tests {
         std::fs::write(hidden.join("absent"), "host-only").unwrap();
         let confinement = Confinement::prepare(&root, std::slice::from_ref(&allowed), &[]).unwrap();
 
+        // Beyond the allowlist: the shell is PID 1 of its own namespace, so
+        // /proc/1/root is the confined root and never reaches the host file;
+        // /dev holds the allowed character devices and nothing like /dev/mem.
         let script = format!(
-            "test -f '{}' && test ! -e '{}' && test ! -e /root/. -o -z \"$(ls -A /root 2>/dev/null)\" \
-             && touch '{}/written'",
-            allowed.join("present").display(),
-            hidden.join("absent").display(),
-            allowed.display(),
+            "test -f '{present}' && test ! -e '{absent}' && test $$ = 1 \
+             && test ! -e '/proc/1/root{absent}' && test -d /proc/self \
+             && test -c /dev/null && test ! -e /dev/mem && test ! -e /dev/sda \
+             && test -c /dev/pts/ptmx && test -L /dev/ptmx \
+             && echo ok > /dev/null && touch '{allowed}/written'",
+            present = allowed.join("present").display(),
+            absent = hidden.join("absent").display(),
+            allowed = allowed.display(),
         );
         let mut command = Command::new("/bin/sh");
         command.args(["-c", &script]);
